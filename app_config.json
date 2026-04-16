@@ -1,0 +1,126 @@
+{
+  "DockLayoutXml": "\u003C?xml version=\u00221.0\u0022 encoding=\u0022utf-16\u0022?\u003E\r\n\u003CLayoutRoot\u003E\r\n  \u003CRootPanel Orientation=\u0022Vertical\u0022\u003E\r\n    \u003CLayoutPanel Orientation=\u0022Horizontal\u0022\u003E\r\n      \u003CLayoutDocumentPaneGroup Orientation=\u0022Horizontal\u0022\u003E\r\n        \u003CLayoutDocumentPane Id=\u002263c5307c-0c84-4dd1-8db3-d81cd824a4db\u0022\u003E\r\n          \u003CLayoutDocument Title=\u0022\u793A\u6CE2\u5668\u0022 ContentId=\u0022bb8e705d\u0022 LastActivationTimeStamp=\u002204/16/2026 20:58:57\u0022 /\u003E\r\n          \u003CLayoutDocument Title=\u0022\u4E32\u53E3\u52A9\u624B\u0022 ContentId=\u00221b8921a0\u0022 LastActivationTimeStamp=\u002204/16/2026 20:58:35\u0022 /\u003E\r\n          \u003CLayoutDocument Title=\u0022\u793A\u6CE2\u5668\u0022 IsSelected=\u0022True\u0022 IsLastFocusedDocument=\u0022True\u0022 ContentId=\u0022d38a3d4c\u0022 LastActivationTimeStamp=\u002204/16/2026 20:58:57\u0022 /\u003E\r\n        \u003C/LayoutDocumentPane\u003E\r\n      \u003C/LayoutDocumentPaneGroup\u003E\r\n    \u003C/LayoutPanel\u003E\r\n  \u003C/RootPanel\u003E\r\n  \u003CTopSide /\u003E\r\n  \u003CRightSide /\u003E\r\n  \u003CLeftSide /\u003E\r\n  \u003CBottomSide /\u003E\r\n  \u003CFloatingWindows /\u003E\r\n  \u003CHidden /\u003E\r\n\u003C/LayoutRoot\u003E",
+  "GlobalConfigs": {
+    "LockScale": false,
+    "IsMenuOpen": false,
+    "IsComAreaOpened": false,
+    "CommunicationIndex": 0,
+    "ComSelect": {
+      "Port": "COM5",
+      "Description": "USB \u4E32\u884C\u8BBE\u5907",
+      "FullName": "COM5\uFF08USB \u4E32\u884C\u8BBE\u5907) ",
+      "PortNum": 5,
+      "IsVirtualCom": false
+    },
+    "BaudRateSelect": "115200",
+    "DataBitSelect": 8,
+    "StopBitSelectIndex": 0,
+    "ParitySelectIndex": 0,
+    "FlowControlBitSelectIndex": 0,
+    "NetworkProtocolSelectIndex": 0,
+    "LocalPort": "8086",
+    "RemoteHostIP": "192.168.xxx.xxx",
+    "RemoteHostPort": "8086",
+    "IsDarkMode": false,
+    "ScaleSelectedIndex": 0
+  },
+  "Components": [
+    {
+      "Id": "bb8e705d",
+      "Type": "OscilloscopeViewModel",
+      "Title": "\u793A\u6CE2\u5668",
+      "Configs": {}
+    },
+    {
+      "Id": "1b8921a0",
+      "Type": "SerialViewModel",
+      "Title": "\u4E32\u53E3\u52A9\u624B",
+      "Configs": {
+        "ExpandAutoSendCycle": "100",
+        "SendCmdList": [
+          {
+            "IsHexSend": false,
+            "IsAutoSend": false,
+            "SendMsg": "",
+            "MsgName": "\uE62F",
+            "Index": 0,
+            "SendDelay": ""
+          },
+          {
+            "IsHexSend": false,
+            "IsAutoSend": false,
+            "SendMsg": "",
+            "MsgName": "\uE62F",
+            "Index": 1,
+            "SendDelay": ""
+          },
+          {
+            "IsHexSend": false,
+            "IsAutoSend": false,
+            "SendMsg": "",
+            "MsgName": "\uE62F",
+            "Index": 2,
+            "SendDelay": ""
+          },
+          {
+            "IsHexSend": false,
+            "IsAutoSend": false,
+            "SendMsg": "",
+            "MsgName": "\uE62F",
+            "Index": 3,
+            "SendDelay": ""
+          },
+          {
+            "IsHexSend": false,
+            "IsAutoSend": false,
+            "SendMsg": "",
+            "MsgName": "\uE62F",
+            "Index": 4,
+            "SendDelay": ""
+          },
+          {
+            "IsHexSend": false,
+            "IsAutoSend": false,
+            "SendMsg": "",
+            "MsgName": "\uE62F",
+            "Index": 5,
+            "SendDelay": ""
+          },
+          {
+            "IsHexSend": false,
+            "IsAutoSend": false,
+            "SendMsg": "",
+            "MsgName": "\uE62F",
+            "Index": 6,
+            "SendDelay": ""
+          },
+          {
+            "IsHexSend": false,
+            "IsAutoSend": false,
+            "SendMsg": "",
+            "MsgName": "\uE62F",
+            "Index": 7,
+            "SendDelay": ""
+          }
+        ],
+        "IsReceiveHexShow": false,
+        "IsUTF8": false,
+        "IsReceiveShowWithTime": false,
+        "IsHexSend": false,
+        "IsSendTextShow": false,
+        "IsUsedReturnAndNewLine": false,
+        "SendCycleIsEnabled": true,
+        "AutoSendCycle": "100",
+        "IsAutoSend": false,
+        "SendText": "",
+        "SendHistory": []
+      }
+    },
+    {
+      "Id": "d38a3d4c",
+      "Type": "OscilloscopeViewModel",
+      "Title": "\u793A\u6CE2\u5668",
+      "Configs": {}
+    }
+  ]
+}
