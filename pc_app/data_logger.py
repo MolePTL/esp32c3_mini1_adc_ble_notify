@@ -15,7 +15,8 @@ import csv
 from pathlib import Path
 from typing import Iterable, TextIO
 
-from pc_app.protocol import AdcFrame, CHANNEL_SPECS
+from pc_app.protocol import AdcFrame, CHANNEL_SPECS, vbat_source_voltage_from_adc_voltage_v
+from pc_app.vtem_processor import AdcProcessingResult
 
 BASE_CSV_COLUMNS = [
     "session_index",
@@ -29,7 +30,7 @@ class DataLogger:
     """简单的内存型数据记录器。"""
 
     def __init__(self) -> None:
-        self._records: list[tuple[int, AdcFrame]] = []
+        self._records: list[tuple[int, AdcFrame, AdcProcessingResult | None]] = []
         self._active_session_index: int | None = None
         self._next_session_index = 1
 
@@ -44,7 +45,7 @@ class DataLogger:
 
     @property
     def session_count(self) -> int:
-        return len({session_index for session_index, _ in self._records})
+        return len({session_index for session_index, _, _ in self._records})
 
     @property
     def is_realtime_save_active(self) -> bool:
@@ -62,15 +63,15 @@ class DataLogger:
     def end_session(self) -> None:
         self._active_session_index = None
 
-    def append(self, frame: AdcFrame) -> None:
+    def append(self, frame: AdcFrame, processing_result: AdcProcessingResult | None = None) -> None:
         if self._active_session_index is None:
             self.start_new_session()
 
         session_index = self._active_session_index
-        self._records.append((session_index, frame))
+        self._records.append((session_index, frame, processing_result))
 
         if self.is_realtime_save_active:
-            row = self._build_row(session_index, frame, self._realtime_save_channels)
+            row = self._build_row(session_index, frame, self._realtime_save_channels, processing_result)
             self._realtime_save_writer.writerow(row)
             self._realtime_save_file.flush()
 
@@ -99,8 +100,8 @@ class DataLogger:
             writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
             writer.writeheader()
 
-            for session_index, frame in self._records:
-                writer.writerow(self._build_row(session_index, frame, selected_channels))
+            for session_index, frame, processing_result in self._records:
+                writer.writerow(self._build_row(session_index, frame, selected_channels, processing_result))
 
         return path
 
@@ -158,14 +159,47 @@ class DataLogger:
                         "vtem_voltage_v",
                         "vtem_resistance_ohm",
                         "vtem_temperature_c",
+                        "vtem_spike_filter_mode",
+                        "vtem_median_filter_enabled",
+                        "vtem_filter_cutoff_hz",
+                        "vtem_wire_compensation_ohm",
+                        "vtem_voltage_filtered_v",
+                        "vtem_resistance_filtered_ohm",
+                        "vtem_resistance_compensated_ohm",
+                        "vtem_temperature_compensated_c",
                     ]
                 )
             elif channel_key == "vm":
-                fieldnames.append("vm_voltage_v")
+                fieldnames.extend(
+                    [
+                        "vm_voltage_v",
+                        "vm_spike_filter_mode",
+                        "vm_filter_cutoff_hz",
+                        "vm_voltage_filtered_v",
+                    ]
+                )
             elif channel_key == "va201":
-                fieldnames.append("va201_voltage_v")
+                fieldnames.extend(
+                    [
+                        "va201_voltage_v",
+                        "va201_spike_filter_mode",
+                        "va201_filter_cutoff_hz",
+                        "va201_voltage_filtered_v",
+                        "va201_resistance_ohm",
+                        "va201_resistance_filtered_ohm",
+                    ]
+                )
             elif channel_key == "vbat":
-                fieldnames.append("vbat_voltage_v")
+                fieldnames.extend(
+                    [
+                        "vbat_voltage_v",
+                        "vbat_source_voltage_v",
+                        "vbat_spike_filter_mode",
+                        "vbat_filter_cutoff_hz",
+                        "vbat_voltage_filtered_v",
+                        "vbat_source_voltage_filtered_v",
+                    ]
+                )
         return fieldnames
 
     def _build_row(
@@ -173,6 +207,7 @@ class DataLogger:
         session_index: int,
         frame: AdcFrame,
         selected_channels: tuple[str, ...],
+        processing_result: AdcProcessingResult | None,
     ) -> dict[str, object]:
         row: dict[str, object] = {
             "session_index": session_index,
@@ -182,18 +217,72 @@ class DataLogger:
         }
 
         if "vtem" in selected_channels:
+            vtem_result = None if processing_result is None else processing_result.vtem
             resistance_ohm, temperature_c = frame.try_vtem_pt1000_metrics()
             row["vtem_voltage_v"] = frame.vtem_mv / 1000.0
             row["vtem_resistance_ohm"] = "" if resistance_ohm is None else resistance_ohm
             row["vtem_temperature_c"] = "" if temperature_c is None else temperature_c
+            row["vtem_spike_filter_mode"] = "" if vtem_result is None else vtem_result.spike_filter_mode
+            row["vtem_median_filter_enabled"] = "" if vtem_result is None else vtem_result.median_filter_enabled
+            row["vtem_filter_cutoff_hz"] = "" if vtem_result is None else vtem_result.filter_cutoff_hz or ""
+            row["vtem_wire_compensation_ohm"] = (
+                "" if vtem_result is None else vtem_result.wire_compensation_ohm
+            )
+            row["vtem_voltage_filtered_v"] = "" if vtem_result is None else vtem_result.filtered_voltage_v
+            row["vtem_resistance_filtered_ohm"] = self._blank_if_none(
+                None if vtem_result is None else vtem_result.filtered_resistance_ohm
+            )
+            row["vtem_resistance_compensated_ohm"] = self._blank_if_none(
+                None if vtem_result is None else vtem_result.compensated_resistance_ohm
+            )
+            row["vtem_temperature_compensated_c"] = self._blank_if_none(
+                None if vtem_result is None else vtem_result.compensated_temperature_c
+            )
 
         if "vm" in selected_channels:
             row["vm_voltage_v"] = frame.vm_mv / 1000.0
+            row["vm_spike_filter_mode"] = self._spike_mode_or_blank(processing_result, "vm")
+            row["vm_filter_cutoff_hz"] = self._cutoff_or_blank(processing_result, "vm")
+            row["vm_voltage_filtered_v"] = self._filtered_voltage_or_blank(processing_result, "vm")
 
         if "va201" in selected_channels:
+            resistance_ohm = frame.try_va201_resistance_ohm()
+            filtered_resistance_ohm = (
+                None if processing_result is None else processing_result.try_va201_resistance_ohm()
+            )
             row["va201_voltage_v"] = frame.va201_mv / 1000.0
+            row["va201_spike_filter_mode"] = self._spike_mode_or_blank(processing_result, "va201")
+            row["va201_filter_cutoff_hz"] = self._cutoff_or_blank(processing_result, "va201")
+            row["va201_voltage_filtered_v"] = self._filtered_voltage_or_blank(processing_result, "va201")
+            row["va201_resistance_ohm"] = self._blank_if_none(resistance_ohm)
+            row["va201_resistance_filtered_ohm"] = self._blank_if_none(filtered_resistance_ohm)
 
         if "vbat" in selected_channels:
+            filtered_vbat_adc_v = None if processing_result is None else processing_result.filtered_voltage_v("vbat")
             row["vbat_voltage_v"] = frame.vbat_mv / 1000.0
+            row["vbat_source_voltage_v"] = vbat_source_voltage_from_adc_voltage_v(frame.vbat_mv / 1000.0)
+            row["vbat_spike_filter_mode"] = self._spike_mode_or_blank(processing_result, "vbat")
+            row["vbat_filter_cutoff_hz"] = self._cutoff_or_blank(processing_result, "vbat")
+            row["vbat_voltage_filtered_v"] = self._filtered_voltage_or_blank(processing_result, "vbat")
+            row["vbat_source_voltage_filtered_v"] = (
+                "" if filtered_vbat_adc_v is None else vbat_source_voltage_from_adc_voltage_v(filtered_vbat_adc_v)
+            )
 
         return row
+
+    @staticmethod
+    def _filtered_voltage_or_blank(processing_result: AdcProcessingResult | None, channel_key: str) -> object:
+        return "" if processing_result is None else processing_result.filtered_voltage_v(channel_key)
+
+    @staticmethod
+    def _spike_mode_or_blank(processing_result: AdcProcessingResult | None, channel_key: str) -> object:
+        return "" if processing_result is None else processing_result.spike_filter_mode(channel_key)
+
+    @staticmethod
+    def _cutoff_or_blank(processing_result: AdcProcessingResult | None, channel_key: str) -> object:
+        cutoff_hz = None if processing_result is None else processing_result.ema_cutoff_hz(channel_key)
+        return "" if cutoff_hz is None else cutoff_hz
+
+    @staticmethod
+    def _blank_if_none(value: float | None) -> object:
+        return "" if value is None else value

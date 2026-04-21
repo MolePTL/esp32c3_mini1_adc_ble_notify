@@ -159,12 +159,24 @@ CHARACTERISTIC_UUID_CANDIDATES = tuple(
 # ==================== PT1000 换算配置 ====================
 # 当前按以下接法解释 VTEM 通道：
 #   3.3V -> 3.3k -> ADC 节点 -> PT1000 -> GND
-PT1000_DIVIDER_SUPPLY_V = 3.3
+PT1000_DIVIDER_SUPPLY_V = 3.302
 PT1000_DIVIDER_SERIES_OHM = 3300.0
 PT1000_R0_OHM = 1000.0
 PT1000_COEFF_A = 3.9083e-3
 PT1000_COEFF_B = -5.775e-7
 PT1000_COEFF_C = -4.183e-12
+
+# ==================== FlexiForce A201 换算配置 ====================
+# 当前按以下运放电路解释 VA201 通道：
+#   A201 -> 反相输入，0.5V 基准接同相输入，反馈电阻约 47.5kΩ
+A201_REFERENCE_V = 0.5
+A201_FEEDBACK_RESISTANCE_OHM = 75000.0
+
+# ==================== VBAT 分压换算配置 ====================
+# 当前按以下电阻顺序解释 VBAT 通道：
+#   VBAT -> 39kΩ -> ADC 节点 -> 100kΩ -> GND
+VBAT_DIVIDER_TOP_OHM = 39000.0
+VBAT_DIVIDER_BOTTOM_OHM = 100000.0
 
 
 def pt1000_resistance_from_divider_voltage_v(voltage_v: float) -> float:
@@ -232,6 +244,23 @@ def pt1000_temperature_from_divider_voltage_v(voltage_v: float) -> float:
     """把 PT1000 分压节点电压直接换算为摄氏温度。"""
     resistance_ohm = pt1000_resistance_from_divider_voltage_v(voltage_v)
     return pt1000_temperature_from_resistance_ohm(resistance_ohm)
+
+
+def a201_resistance_from_output_voltage_v(voltage_v: float) -> float:
+    """按当前运放电路把 VA201 输出电压反算为 A201 等效电阻。"""
+    voltage_delta_v = voltage_v - A201_REFERENCE_V
+    if voltage_delta_v <= 0.0:
+        raise ValueError(
+            f"A201 output voltage must be greater than {A201_REFERENCE_V} V, got {voltage_v}"
+        )
+
+    return A201_FEEDBACK_RESISTANCE_OHM * A201_REFERENCE_V / voltage_delta_v
+
+
+def vbat_source_voltage_from_adc_voltage_v(voltage_v: float) -> float:
+    """按 39k/100k 分压把 VBAT ADC 节点电压还原为电池端电压。"""
+    divider_ratio = (VBAT_DIVIDER_TOP_OHM + VBAT_DIVIDER_BOTTOM_OHM) / VBAT_DIVIDER_BOTTOM_OHM
+    return voltage_v * divider_ratio
 
 
 class ProtocolError(ValueError):
@@ -342,6 +371,16 @@ class AdcFrame:
         """把 VTEM 通道按 PT1000 分压模型换算为温度。"""
         return pt1000_temperature_from_resistance_ohm(self.vtem_pt1000_resistance_ohm)
 
+    @property
+    def va201_resistance_ohm(self) -> float:
+        """把 VA201 通道按 A201 运放模型换算为传感器等效阻值。"""
+        return a201_resistance_from_output_voltage_v(self.va201_mv / 1000.0)
+
+    @property
+    def vbat_source_voltage_v(self) -> float:
+        """把 VBAT ADC 节点电压还原为电池端电压。"""
+        return vbat_source_voltage_from_adc_voltage_v(self.vbat_mv / 1000.0)
+
     def try_vtem_pt1000_metrics(self) -> tuple[float | None, float | None]:
         """安全获取 VTEM 的 PT1000 阻值和温度。
 
@@ -360,6 +399,13 @@ class AdcFrame:
             return resistance_ohm, None
 
         return resistance_ohm, temperature_c
+
+    def try_va201_resistance_ohm(self) -> float | None:
+        """安全获取 A201 等效阻值。"""
+        try:
+            return self.va201_resistance_ohm
+        except ValueError:
+            return None
 
 
 @dataclass(slots=True)

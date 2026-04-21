@@ -28,9 +28,10 @@ from typing import Any
 
 import pyqtgraph as pg
 from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtWidgets import QLabel, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QGridLayout, QLabel, QVBoxLayout, QWidget
 
 from pc_app.protocol import AdcFrame, CHANNEL_SPECS
+from pc_app.vtem_processor import AdcProcessingResult
 
 
 class RealtimePlotWidget(QWidget):
@@ -48,6 +49,7 @@ class RealtimePlotWidget(QWidget):
         self._max_points = max_points
         self._x_values: deque[float] = deque(maxlen=max_points)
         self._frames: deque[AdcFrame] = deque(maxlen=max_points)
+        self._processing_results: deque[AdcProcessingResult | None] = deque(maxlen=max_points)
         self._channels = {
             key: deque(maxlen=max_points) for key, _, _ in CHANNEL_SPECS
         }
@@ -107,13 +109,16 @@ class RealtimePlotWidget(QWidget):
             marker.hide()
             self._cursor_markers[key] = marker
 
-        self._cursor_readout = QLabel("读点：暂无数据。")
-        self._cursor_readout.setWordWrap(True)
+        self._raw_readout_labels: dict[str, QLabel] = {}
+        self._converted_readout_labels: dict[str, QLabel] = {}
+        self._readout_status = QLabel("读点：暂无数据。")
+        self._readout_panel = self._build_readout_panel()
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.plot_widget)
-        layout.addWidget(self._cursor_readout)
+        layout.addWidget(self._readout_panel)
+        layout.addWidget(self._readout_status)
 
         self._refresh_timer = QTimer(self)
         self._refresh_timer.setInterval(33)
@@ -132,7 +137,7 @@ class RealtimePlotWidget(QWidget):
 
         self._apply_manual_y_range()
 
-    def append_frame(self, frame: AdcFrame) -> None:
+    def append_frame(self, frame: AdcFrame, processing_result: AdcProcessingResult | None = None) -> None:
         """把一帧新数据追加到内部缓存。"""
         if self._last_timestamp_ms is not None and frame.timestamp_ms < self._last_timestamp_ms:
             self._reset_buffers()
@@ -143,9 +148,13 @@ class RealtimePlotWidget(QWidget):
         x_value = (frame.timestamp_ms - self._base_timestamp_ms) / 1000.0
         self._x_values.append(x_value)
         self._frames.append(frame)
+        self._processing_results.append(processing_result)
 
         for key, _, attr_name in CHANNEL_SPECS:
-            self._channels[key].append(getattr(frame, attr_name) / 1000.0)
+            if processing_result is not None:
+                self._channels[key].append(processing_result.filtered_voltage_v(key))
+            else:
+                self._channels[key].append(getattr(frame, attr_name) / 1000.0)
 
         self._last_timestamp_ms = frame.timestamp_ms
 
@@ -155,9 +164,12 @@ class RealtimePlotWidget(QWidget):
                 self._cursor_locked = False
                 self._locked_frame_id = None
                 self._clear_cursor()
-                self._cursor_readout.setText("读点：已锁定的采样点已滑出当前窗口。")
+                self._readout_status.setText("读点：已锁定的采样点已滑出当前窗口。")
             else:
                 self._show_cursor_at_index(locked_index, locked=True)
+        elif not self._cursor_locked:
+            self._update_readout_panel(frame, processing_result)
+            self._readout_status.setText(f"实时：帧={frame.frame_id}，时间戳={frame.timestamp_ms} ms")
 
         self._dirty = True
 
@@ -241,6 +253,7 @@ class RealtimePlotWidget(QWidget):
         """重置内部缓存与时间基准。"""
         self._x_values.clear()
         self._frames.clear()
+        self._processing_results.clear()
         for channel in self._channels.values():
             channel.clear()
 
@@ -249,7 +262,8 @@ class RealtimePlotWidget(QWidget):
         self._cursor_locked = False
         self._locked_frame_id = None
         self._clear_cursor()
-        self._cursor_readout.setText("读点：暂无数据。")
+        self._clear_readout_panel()
+        self._readout_status.setText("读点：暂无数据。")
 
     def _refresh_plot(self, force: bool = False) -> None:
         """把缓存中的数据真正更新到图上。"""
@@ -368,7 +382,7 @@ class RealtimePlotWidget(QWidget):
         view_box = self.plot_widget.getPlotItem().vb
         if not view_box.sceneBoundingRect().contains(scene_pos):
             self._clear_cursor()
-            self._cursor_readout.setText("读点：鼠标悬停查看，单击锁定/解锁。")
+            self._readout_status.setText("读点：鼠标悬停查看，单击锁定/解锁。")
             return
 
         plot_pos = view_box.mapSceneToView(scene_pos)
@@ -433,6 +447,7 @@ class RealtimePlotWidget(QWidget):
 
         x_value = self._x_values[index]
         frame = self._frames[index]
+        processing_result = self._processing_results[index]
         self._cursor_line.setPos(x_value)
         self._cursor_line.show()
 
@@ -444,37 +459,91 @@ class RealtimePlotWidget(QWidget):
                 self._cursor_markers[key].hide()
 
         state_text = "已锁定" if locked else "悬停"
-        parts = [
-            f"读点[{state_text}]",
-            f"t={x_value:.3f} s",
-            f"帧={frame.frame_id}",
-            f"时间戳={frame.timestamp_ms} ms",
-        ]
+        self._update_readout_panel(frame, processing_result)
+        self._readout_status.setText(
+            f"读点[{state_text}]：t={x_value:.3f} s，帧={frame.frame_id}，时间戳={frame.timestamp_ms} ms"
+        )
 
-        visible_channel_count = 0
-        for key, label, attr_name in CHANNEL_SPECS:
-            if not self._visible_channels[key]:
-                continue
-            visible_channel_count += 1
-            parts.append(f"{label}={getattr(frame, attr_name) / 1000.0:.3f} V")
+    def _build_readout_panel(self) -> QWidget:
+        panel = QWidget()
+        layout = QGridLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setHorizontalSpacing(10)
+        layout.setVerticalSpacing(4)
+        layout.addWidget(QLabel("通道"), 0, 0)
+        layout.addWidget(QLabel("原始电压"), 0, 1)
+        layout.addWidget(QLabel("转换/处理值"), 0, 2)
 
-        if self._visible_channels["vtem"]:
-            resistance_ohm, temperature_c = frame.try_vtem_pt1000_metrics()
-            parts.append(
-                "PT1000={resistance} / {temperature}".format(
-                    resistance="-"
-                    if resistance_ohm is None
-                    else f"{resistance_ohm:.1f} Ω",
-                    temperature="-"
-                    if temperature_c is None
-                    else f"{temperature_c:.2f} °C",
-                )
-            )
+        for row, (channel_key, label, _) in enumerate(CHANNEL_SPECS, start=1):
+            raw_label = QLabel("-")
+            converted_label = QLabel("-")
+            raw_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            converted_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            raw_label.setFixedWidth(140)
+            converted_label.setFixedWidth(180)
+            layout.addWidget(QLabel(label), row, 0)
+            layout.addWidget(raw_label, row, 1)
+            layout.addWidget(converted_label, row, 2)
+            self._raw_readout_labels[channel_key] = raw_label
+            self._converted_readout_labels[channel_key] = converted_label
 
-        if visible_channel_count == 0:
-            parts.append("当前未显示任何通道。")
+        layout.setColumnStretch(3, 1)
+        self._clear_readout_panel()
+        return panel
 
-        self._cursor_readout.setText(" | ".join(parts))
+    def _clear_readout_panel(self) -> None:
+        for label in self._raw_readout_labels.values():
+            label.setText("-")
+        for label in self._converted_readout_labels.values():
+            label.setText("-")
+
+    def _update_readout_panel(
+        self,
+        frame: AdcFrame,
+        processing_result: AdcProcessingResult | None,
+    ) -> None:
+        raw_values = {
+            "vtem": frame.vtem_mv / 1000.0,
+            "vm": frame.vm_mv / 1000.0,
+            "va201": frame.va201_mv / 1000.0,
+            "vbat": frame.vbat_mv / 1000.0,
+        }
+
+        for channel_key, voltage_v in raw_values.items():
+            self._raw_readout_labels[channel_key].setText(self._format_voltage(voltage_v))
+
+        if processing_result is None:
+            _resistance_ohm, temperature_c = frame.try_vtem_pt1000_metrics()
+            va201_resistance_ohm = frame.try_va201_resistance_ohm()
+            vm_voltage_v = frame.vm_mv / 1000.0
+            vbat_voltage_v = frame.vbat_source_voltage_v
+        else:
+            temperature_c = processing_result.vtem.compensated_temperature_c
+            va201_resistance_ohm = processing_result.try_va201_resistance_ohm()
+            vm_voltage_v = processing_result.filtered_voltage_v("vm")
+            vbat_voltage_v = processing_result.vbat_source_voltage_v()
+
+        self._converted_readout_labels["vtem"].setText(self._format_temperature(temperature_c))
+        self._converted_readout_labels["vm"].setText(self._format_voltage(vm_voltage_v))
+        self._converted_readout_labels["va201"].setText(self._format_resistance(va201_resistance_ohm))
+        self._converted_readout_labels["vbat"].setText(self._format_voltage(vbat_voltage_v))
+
+    @staticmethod
+    def _format_voltage(voltage_v: float | None) -> str:
+        return "-" if voltage_v is None else f"{voltage_v:8.3f} V"
+
+    @staticmethod
+    def _format_temperature(temperature_c: float | None) -> str:
+        return "-" if temperature_c is None else f"{temperature_c:8.2f} °C"
+
+    def _format_resistance(self, resistance_ohm: float | None) -> str:
+        if resistance_ohm is None:
+            return "-"
+        if resistance_ohm >= 1_000_000.0:
+            return f"{resistance_ohm / 1_000_000.0:.3f} MΩ"
+        if resistance_ohm >= 1_000.0:
+            return f"{resistance_ohm / 1_000.0:.3f} kΩ"
+        return f"{resistance_ohm:.1f} Ω"
 
     def _clear_cursor(self) -> None:
         """隐藏当前读点光标。"""

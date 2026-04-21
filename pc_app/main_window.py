@@ -12,15 +12,17 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -48,6 +50,14 @@ from pc_app.protocol import (
     PT1000_DIVIDER_SUPPLY_V,
     AdcFrame,
 )
+from pc_app.vtem_processor import (
+    SPIKE_FILTER_HOLD,
+    SPIKE_FILTER_LABELS,
+    SPIKE_FILTER_MEDIAN3,
+    SPIKE_FILTER_MEDIAN5,
+    SPIKE_FILTER_NONE,
+    AdcProcessor,
+)
 
 
 class MainWindow(QMainWindow):
@@ -65,9 +75,14 @@ class MainWindow(QMainWindow):
 
         self.logger = DataLogger()
         self.ble = BleClientBridge(self)
+        self.adc_processor = AdcProcessor(default_ema_cutoff_hz=5.0)
+        self.realtime_save_timer = QTimer(self)
+        self._realtime_save_segment_index = 0
+        self._realtime_save_channels: tuple[str, ...] = ()
 
         self.display_channel_checkboxes: dict[str, QCheckBox] = {}
         self.save_channel_checkboxes: dict[str, QCheckBox] = {}
+        self.filter_channel_combos: dict[str, QComboBox] = {}
 
         self._build_ui()
         self._connect_signals()
@@ -134,8 +149,6 @@ class MainWindow(QMainWindow):
         self.frame_rate_label = QLabel("0.0 帧/秒")
         self.valid_frames_label = QLabel("0")
         self.invalid_frames_label = QLabel("0")
-        self.vtem_resistance_label = QLabel("-")
-        self.vtem_temperature_label = QLabel("-")
         self.last_error_label = QLabel("-")
         self.last_error_label.setWordWrap(True)
 
@@ -147,8 +160,6 @@ class MainWindow(QMainWindow):
         status_layout.addRow("接收速率", self.frame_rate_label)
         status_layout.addRow("有效帧数", self.valid_frames_label)
         status_layout.addRow("无效帧数", self.invalid_frames_label)
-        status_layout.addRow("VTEM 阻值", self.vtem_resistance_label)
-        status_layout.addRow("VTEM 温度", self.vtem_temperature_label)
         status_layout.addRow("最近错误", self.last_error_label)
 
         control_group = QGroupBox("数据操作")
@@ -162,14 +173,25 @@ class MainWindow(QMainWindow):
         self.exit_button = QPushButton("安全退出")
         self.record_status_label = QLabel("记录状态：未开启。")
         self.record_status_label.setWordWrap(True)
+        self.save_interval_spin = QDoubleSpinBox()
+        self.save_interval_spin.setRange(1.0, 3600.0)
+        self.save_interval_spin.setDecimals(0)
+        self.save_interval_spin.setSingleStep(10.0)
+        self.save_interval_spin.setValue(60.0)
+        self.save_interval_spin.setSuffix(" s")
 
         top_row.addWidget(self.record_button)
         top_row.addWidget(self.save_csv_button)
         bottom_row.addWidget(self.clear_display_button)
         bottom_row.addWidget(self.clear_cache_button)
         bottom_row.addWidget(self.exit_button)
+        save_interval_row = QHBoxLayout()
+        save_interval_row.addWidget(QLabel("定时保存间隔"))
+        save_interval_row.addWidget(self.save_interval_spin)
+        save_interval_row.addStretch(1)
         control_layout.addLayout(top_row)
         control_layout.addLayout(bottom_row)
+        control_layout.addLayout(save_interval_row)
         control_layout.addWidget(self.record_status_label)
 
         log_group = QGroupBox("调试日志")
@@ -256,10 +278,49 @@ class MainWindow(QMainWindow):
         save_row.addWidget(self.save_follow_display_checkbox)
         save_row.addStretch(1)
 
+        filter_grid = QGridLayout()
+        filter_grid.addWidget(QLabel("去尖峰"), 0, 0)
+        self.spike_filter_combo = QComboBox()
+        for mode in (
+            SPIKE_FILTER_NONE,
+            SPIKE_FILTER_MEDIAN3,
+            SPIKE_FILTER_MEDIAN5,
+            SPIKE_FILTER_HOLD,
+        ):
+            self.spike_filter_combo.addItem(SPIKE_FILTER_LABELS[mode], mode)
+        self.spike_filter_combo.setCurrentIndex(1)
+        filter_grid.addWidget(self.spike_filter_combo, 0, 1)
+
+        for column, (channel_key, label, _) in enumerate(CHANNEL_SPECS):
+            filter_grid.addWidget(QLabel(f"{label} EMA"), 1, column * 2)
+            combo = QComboBox()
+            combo.addItem("关闭", None)
+            combo.addItem("2 Hz", 2.0)
+            combo.addItem("5 Hz", 5.0)
+            combo.addItem("10 Hz", 10.0)
+            combo.setCurrentIndex(2)
+            self.filter_channel_combos[channel_key] = combo
+            filter_grid.addWidget(combo, 1, column * 2 + 1)
+
+        vtem_row = QHBoxLayout()
+        self.vtem_wire_comp_checkbox = QCheckBox("导线补偿")
+        self.vtem_wire_comp_spin = QDoubleSpinBox()
+        self.vtem_wire_comp_spin.setRange(0.0, 100.0)
+        self.vtem_wire_comp_spin.setDecimals(3)
+        self.vtem_wire_comp_spin.setSingleStep(0.1)
+        self.vtem_wire_comp_spin.setSuffix(" Ω")
+        self.vtem_wire_comp_spin.setEnabled(False)
+        vtem_row.addWidget(self.vtem_wire_comp_checkbox)
+        vtem_row.addWidget(QLabel("导线总电阻"))
+        vtem_row.addWidget(self.vtem_wire_comp_spin)
+        vtem_row.addStretch(1)
+
         scope_layout.addLayout(view_row)
         scope_layout.addLayout(range_row)
         scope_layout.addLayout(display_row)
         scope_layout.addLayout(save_row)
+        scope_layout.addLayout(filter_grid)
+        scope_layout.addLayout(vtem_row)
 
         self.plot_widget = RealtimePlotWidget()
         right_layout.addWidget(scope_group)
@@ -281,6 +342,7 @@ class MainWindow(QMainWindow):
         self.clear_display_button.clicked.connect(self._clear_display)
         self.clear_cache_button.clicked.connect(self._clear_unsaved_cache)
         self.exit_button.clicked.connect(self._request_safe_exit)
+        self.realtime_save_timer.timeout.connect(self._rotate_realtime_save_file)
 
         self.toggle_display_button.clicked.connect(self._toggle_display)
         self.auto_follow_checkbox.toggled.connect(self.plot_widget.set_auto_follow_enabled)
@@ -293,7 +355,13 @@ class MainWindow(QMainWindow):
         self.show_all_channels_button.clicked.connect(self._show_all_channels)
         self.hide_all_channels_button.clicked.connect(self._hide_all_channels)
         self.save_follow_display_checkbox.toggled.connect(self._handle_save_follow_display_toggled)
+        self.spike_filter_combo.currentIndexChanged.connect(self._handle_filter_settings_changed)
+        self.vtem_wire_comp_checkbox.toggled.connect(self._handle_vtem_wire_compensation_changed)
+        self.vtem_wire_comp_spin.valueChanged.connect(self._handle_vtem_wire_compensation_changed)
         self.plot_widget.auto_follow_changed.connect(self._sync_auto_follow_checkbox)
+
+        for combo in self.filter_channel_combos.values():
+            combo.currentIndexChanged.connect(self._handle_filter_settings_changed)
 
         for channel_key, checkbox in self.display_channel_checkboxes.items():
             checkbox.toggled.connect(
@@ -319,6 +387,7 @@ class MainWindow(QMainWindow):
         for channel_key, checkbox in self.display_channel_checkboxes.items():
             self.plot_widget.set_channel_visibility(channel_key, checkbox.isChecked())
         self._sync_save_channels_with_display()
+        self._apply_filter_settings(reset_filter=True)
         self._update_y_range_controls()
         self._update_record_ui()
 
@@ -356,21 +425,18 @@ class MainWindow(QMainWindow):
         self.disconnect_button.setEnabled(connected)
 
         if connected and not was_connected:
+            self.adc_processor.reset()
             self.plot_widget.clear_data()
-            self._reset_live_measurements()
             self._set_display_enabled(True)
         elif not connected and was_connected:
             self.logger.end_session()
             self.plot_widget.clear_data()
-            self._reset_live_measurements()
             self._set_display_enabled(True)
 
     def _handle_frame(self, frame: AdcFrame) -> None:
-        self.logger.append(frame)
-        resistance_ohm, temperature_c = frame.try_vtem_pt1000_metrics()
-        self.vtem_resistance_label.setText("-" if resistance_ohm is None else f"{resistance_ohm:.1f} Ω")
-        self.vtem_temperature_label.setText("-" if temperature_c is None else f"{temperature_c:.2f} °C")
-        self.plot_widget.append_frame(frame)
+        processing_result = self.adc_processor.process(frame)
+        self.logger.append(frame, processing_result)
+        self.plot_widget.append_frame(frame, processing_result)
 
     def _update_stats(self, stats: dict) -> None:
         self.frame_rate_label.setText(f"{stats.get('frame_rate', 0.0):.1f} 帧/秒")
@@ -446,6 +512,32 @@ class MainWindow(QMainWindow):
             self._sync_save_channels_with_display()
         self._refresh_save_channel_controls()
 
+    def _handle_filter_settings_changed(self) -> None:
+        self._apply_filter_settings(reset_filter=True)
+        self.plot_widget.clear_data()
+        spike_mode = SPIKE_FILTER_LABELS[self.adc_processor.spike_filter_mode]
+        self._append_log(f"滤波设置已切换：{spike_mode}，滤波状态已重置。")
+
+    def _handle_vtem_wire_compensation_changed(self) -> None:
+        self._apply_filter_settings(reset_filter=False)
+
+    def _apply_filter_settings(self, reset_filter: bool) -> None:
+        spike_mode = self.spike_filter_combo.currentData()
+        wire_compensation_ohm = (
+            self.vtem_wire_comp_spin.value() if self.vtem_wire_comp_checkbox.isChecked() else 0.0
+        )
+
+        if reset_filter or spike_mode != self.adc_processor.spike_filter_mode:
+            self.adc_processor.set_spike_filter_mode(spike_mode)
+
+        for channel_key, combo in self.filter_channel_combos.items():
+            cutoff_hz = combo.currentData()
+            if reset_filter or cutoff_hz != self.adc_processor.ema_cutoff_hz(channel_key):
+                self.adc_processor.set_channel_ema_cutoff_hz(channel_key, cutoff_hz)
+
+        self.adc_processor.set_wire_compensation_ohm(wire_compensation_ohm)
+        self.vtem_wire_comp_spin.setEnabled(self.vtem_wire_comp_checkbox.isChecked())
+
     def _sync_auto_follow_checkbox(self, enabled: bool) -> None:
         previous = self.auto_follow_checkbox.blockSignals(True)
         self.auto_follow_checkbox.setChecked(enabled)
@@ -476,35 +568,50 @@ class MainWindow(QMainWindow):
 
     def _toggle_realtime_save(self) -> None:
         if self.logger.is_realtime_save_active:
+            self.realtime_save_timer.stop()
             saved_path = self.logger.stop_realtime_save()
             self._update_record_ui()
             self._append_log(f"实时保存已停止：{saved_path}" if saved_path else "实时保存已停止。")
             return
 
-        default_path = Path.cwd() / "adc_voltage_capture_live.csv"
-        file_path, _ = QFileDialog.getSaveFileName(
-            self,
-            "开始实时保存",
-            str(default_path),
-            "CSV Files (*.csv)",
-        )
-        if not file_path:
-            return
-
-        selected_channels = self._selected_save_channels()
-        saved_path = self.logger.start_realtime_save(file_path, selected_channels)
+        self._realtime_save_channels = self._selected_save_channels()
+        self._realtime_save_segment_index = 1
+        saved_path = self._start_realtime_save_segment()
+        self.realtime_save_timer.start(int(self.save_interval_spin.value() * 1000))
         self._update_record_ui()
         self._append_log(
-            f"实时保存已开始：{saved_path}，保存通道：{self._describe_channels(selected_channels)}"
+            "实时保存已开始：{path}，保存通道：{channels}，分段间隔：{interval:.0f} s".format(
+                path=saved_path,
+                channels=self._describe_channels(self._realtime_save_channels),
+                interval=self.save_interval_spin.value(),
+            )
         )
+
+    def _start_realtime_save_segment(self) -> Path:
+        file_path = self._make_data_file_path("adc_capture", self._realtime_save_segment_index)
+        return self.logger.start_realtime_save(file_path, self._realtime_save_channels)
+
+    def _rotate_realtime_save_file(self) -> None:
+        if not self.logger.is_realtime_save_active:
+            self.realtime_save_timer.stop()
+            return
+
+        old_path = self.logger.stop_realtime_save()
+        self._realtime_save_segment_index += 1
+        new_path = self._start_realtime_save_segment()
+        self._update_record_ui()
+        self._append_log(f"定时保存分段：{old_path} -> {new_path}")
 
     def _update_record_ui(self) -> None:
         active = self.logger.is_realtime_save_active
         self.record_button.setText("停止记录" if active else "开始记录")
         if active and self.logger.realtime_save_path is not None:
-            self.record_status_label.setText(f"记录状态：进行中 -> {self.logger.realtime_save_path}")
+            self.record_status_label.setText(
+                f"记录状态：进行中 -> {self.logger.realtime_save_path}，间隔 {self.save_interval_spin.value():.0f} s"
+            )
         else:
             self.record_status_label.setText("记录状态：未开启。")
+        self.save_interval_spin.setEnabled(not active)
         self._refresh_save_channel_controls()
 
     def _clear_display(self) -> None:
@@ -522,16 +629,19 @@ class MainWindow(QMainWindow):
         self.plot_widget.show_all_data()
         self._append_log("已切换到显示当前缓存的全部时间范围。")
 
-    def _reset_live_measurements(self) -> None:
-        self.vtem_resistance_label.setText("-")
-        self.vtem_temperature_label.setText("-")
+    def _make_data_file_path(self, prefix: str, segment_index: int | None = None) -> Path:
+        now = datetime.now()
+        data_dir = Path.cwd() / "data" / now.strftime("%Y-%m-%d")
+        suffix = "" if segment_index is None else f"_part{segment_index:03d}"
+        return data_dir / f"{prefix}_{now.strftime('%Y%m%d_%H%M%S')}{suffix}.csv"
 
     def _save_csv(self) -> None:
         if self.logger.frame_count == 0:
             QMessageBox.information(self, "暂无数据", "当前还没有接收到可保存的数据。")
             return
 
-        default_path = Path.cwd() / "adc_voltage_capture.csv"
+        default_path = self._make_data_file_path("adc_export")
+        default_path.parent.mkdir(parents=True, exist_ok=True)
         file_path, _ = QFileDialog.getSaveFileName(
             self,
             "导出 CSV",
@@ -597,6 +707,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         if self.logger.is_realtime_save_active:
+            self.realtime_save_timer.stop()
             saved_path = self.logger.stop_realtime_save()
             self._append_log(f"退出前已停止实时保存：{saved_path}")
         self.ble.shutdown()
