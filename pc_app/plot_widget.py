@@ -24,13 +24,20 @@ from __future__ import annotations
 
 from bisect import bisect_left, bisect_right
 from collections import deque
+from math import isfinite
 from typing import Any
 
 import pyqtgraph as pg
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import QGridLayout, QLabel, QVBoxLayout, QWidget
 
-from pc_app.protocol import AdcFrame, CHANNEL_SPECS
+from pc_app.protocol import (
+    AdcFrame,
+    CHANNEL_SPECS,
+    a201_resistance_from_output_voltage_v,
+    pt1000_temperature_from_divider_voltage_v,
+    vbat_source_voltage_from_adc_voltage_v,
+)
 from pc_app.vtem_processor import AdcProcessingResult
 
 
@@ -47,10 +54,19 @@ class RealtimePlotWidget(QWidget):
 
         # 为了支持 60s 级别窗口，缓存长度比原来的 1000 点更大。
         self._max_points = max_points
-        self._x_values: deque[float] = deque(maxlen=max_points)
-        self._frames: deque[AdcFrame] = deque(maxlen=max_points)
-        self._processing_results: deque[AdcProcessingResult | None] = deque(maxlen=max_points)
+        self._offline_loaded = False
+        self._x_values: deque[float] | list[float] = deque(maxlen=max_points)
+        self._frames: deque[AdcFrame] | list[AdcFrame] = deque(maxlen=max_points)
+        self._processing_results: deque[AdcProcessingResult | None] | list[AdcProcessingResult | None] = deque(
+            maxlen=max_points
+        )
+        self._frame_ids: deque[int] | list[int] = deque(maxlen=max_points)
+        self._timestamp_ms_values: deque[int] | list[int] = deque(maxlen=max_points)
+        self._pc_recv_time_texts: deque[str] | list[str] = deque(maxlen=max_points)
         self._channels = {
+            key: deque(maxlen=max_points) for key, _, _ in CHANNEL_SPECS
+        }
+        self._raw_channels = {
             key: deque(maxlen=max_points) for key, _, _ in CHANNEL_SPECS
         }
 
@@ -89,6 +105,9 @@ class RealtimePlotWidget(QWidget):
             )
             for key, _, _ in CHANNEL_SPECS
         }
+        for curve in self._curves.values():
+            curve.setClipToView(True)
+            curve.setDownsampling(auto=True, method="peak")
 
         self._cursor_line = pg.InfiniteLine(
             angle=90,
@@ -139,8 +158,11 @@ class RealtimePlotWidget(QWidget):
 
     def append_frame(self, frame: AdcFrame, processing_result: AdcProcessingResult | None = None) -> None:
         """把一帧新数据追加到内部缓存。"""
+        if self._offline_loaded:
+            self._reset_buffers(restore_live_buffers=True)
+
         if self._last_timestamp_ms is not None and frame.timestamp_ms < self._last_timestamp_ms:
-            self._reset_buffers()
+            self._reset_buffers(restore_live_buffers=True)
 
         if self._base_timestamp_ms is None:
             self._base_timestamp_ms = frame.timestamp_ms
@@ -149,12 +171,17 @@ class RealtimePlotWidget(QWidget):
         self._x_values.append(x_value)
         self._frames.append(frame)
         self._processing_results.append(processing_result)
+        self._frame_ids.append(frame.frame_id)
+        self._timestamp_ms_values.append(frame.timestamp_ms)
+        self._pc_recv_time_texts.append(frame.pc_recv_time.isoformat(timespec="milliseconds"))
 
         for key, _, attr_name in CHANNEL_SPECS:
+            raw_voltage_v = getattr(frame, attr_name) / 1000.0
+            self._raw_channels[key].append(raw_voltage_v)
             if processing_result is not None:
                 self._channels[key].append(processing_result.filtered_voltage_v(key))
             else:
-                self._channels[key].append(getattr(frame, attr_name) / 1000.0)
+                self._channels[key].append(raw_voltage_v)
 
         self._last_timestamp_ms = frame.timestamp_ms
 
@@ -245,17 +272,77 @@ class RealtimePlotWidget(QWidget):
 
     def clear_data(self) -> None:
         """清空当前波形缓存并立即刷新显示。"""
-        self._reset_buffers()
+        self._reset_buffers(restore_live_buffers=True)
         self._dirty = True
         self._refresh_plot(force=True)
 
-    def _reset_buffers(self) -> None:
+    def load_sample_series(
+        self,
+        x_values: list[float],
+        raw_channels: dict[str, list[float]],
+        plot_channels: dict[str, list[float]],
+        frame_ids: list[int],
+        timestamp_ms_values: list[int],
+        pc_recv_time_texts: list[str],
+    ) -> None:
+        """Load a complete offline series for review instead of live scrolling data."""
+        self._reset_buffers(restore_live_buffers=True)
+
+        expected_count = len(x_values)
+        self._x_values = list(x_values)
+        self._frames = []
+        self._processing_results = []
+        self._frame_ids = list(frame_ids[:expected_count])
+        self._timestamp_ms_values = list(timestamp_ms_values[:expected_count])
+        self._pc_recv_time_texts = list(pc_recv_time_texts[:expected_count])
+        self._channels = {
+            key: self._normalized_channel_values(plot_channels.get(key, []), expected_count)
+            for key, _, _ in CHANNEL_SPECS
+        }
+        self._raw_channels = {
+            key: self._normalized_channel_values(raw_channels.get(key, []), expected_count)
+            for key, _, _ in CHANNEL_SPECS
+        }
+        self._offline_loaded = True
+
+        if self._auto_follow_enabled:
+            self._auto_follow_enabled = False
+            self.auto_follow_changed.emit(False)
+
+        if self._x_values:
+            self._show_cursor_at_index(len(self._x_values) - 1, locked=False)
+            self._apply_view_ranges(force_show_all=True)
+
+        self._dirty = True
+        self._refresh_plot(force=True)
+
+    def _reset_buffers(self, restore_live_buffers: bool = False) -> None:
         """重置内部缓存与时间基准。"""
-        self._x_values.clear()
-        self._frames.clear()
-        self._processing_results.clear()
-        for channel in self._channels.values():
-            channel.clear()
+        if restore_live_buffers or self._offline_loaded:
+            self._x_values = deque(maxlen=self._max_points)
+            self._frames = deque(maxlen=self._max_points)
+            self._processing_results = deque(maxlen=self._max_points)
+            self._frame_ids = deque(maxlen=self._max_points)
+            self._timestamp_ms_values = deque(maxlen=self._max_points)
+            self._pc_recv_time_texts = deque(maxlen=self._max_points)
+            self._channels = {
+                key: deque(maxlen=self._max_points) for key, _, _ in CHANNEL_SPECS
+            }
+            self._raw_channels = {
+                key: deque(maxlen=self._max_points) for key, _, _ in CHANNEL_SPECS
+            }
+            self._offline_loaded = False
+        else:
+            self._x_values.clear()
+            self._frames.clear()
+            self._processing_results.clear()
+            self._frame_ids.clear()
+            self._timestamp_ms_values.clear()
+            self._pc_recv_time_texts.clear()
+            for channel in self._channels.values():
+                channel.clear()
+            for channel in self._raw_channels.values():
+                channel.clear()
 
         self._base_timestamp_ms = None
         self._last_timestamp_ms = None
@@ -273,11 +360,11 @@ class RealtimePlotWidget(QWidget):
         if not self._live_updates_enabled and not force:
             return
 
-        x_data = list(self._x_values)
+        x_data = self._as_list(self._x_values)
         for key, curve in self._curves.items():
             curve.setVisible(self._visible_channels[key])
             if self._visible_channels[key]:
-                curve.setData(x_data, list(self._channels[key]))
+                curve.setData(x_data, self._as_list(self._channels[key]))
             else:
                 curve.setData([], [])
 
@@ -324,7 +411,7 @@ class RealtimePlotWidget(QWidget):
 
         view_box = self.plot_widget.getPlotItem().vb
         x_min, x_max = view_box.viewRange()[0]
-        x_values = list(self._x_values)
+        x_values = self._as_list(self._x_values)
         left = bisect_left(x_values, x_min)
         right = bisect_right(x_values, x_max)
         if right <= left:
@@ -333,7 +420,9 @@ class RealtimePlotWidget(QWidget):
 
         values_in_range: list[float] = []
         for key in visible_keys:
-            values_in_range.extend(list(self._channels[key])[left:right])
+            values_in_range.extend(
+                value for value in self._as_list(self._channels[key])[left:right] if isfinite(value)
+            )
 
         if not values_in_range:
             self._apply_manual_y_range()
@@ -375,7 +464,7 @@ class RealtimePlotWidget(QWidget):
 
     def _handle_mouse_moved(self, event: tuple[Any, ...]) -> None:
         """鼠标悬停时显示最近点读数。"""
-        if self._cursor_locked or not self._frames:
+        if self._cursor_locked or not self._x_values:
             return
 
         scene_pos = event[0]
@@ -392,7 +481,7 @@ class RealtimePlotWidget(QWidget):
 
     def _handle_mouse_clicked(self, event: Any) -> None:
         """左键单击锁定或解锁当前读点。"""
-        if event.button() != Qt.LeftButton or not self._frames:
+        if event.button() != Qt.LeftButton or not self._x_values:
             return
 
         view_box = self.plot_widget.getPlotItem().vb
@@ -412,7 +501,7 @@ class RealtimePlotWidget(QWidget):
             return
 
         self._cursor_locked = True
-        self._locked_frame_id = self._frames[nearest_index].frame_id
+        self._locked_frame_id = self._frame_id_at_index(nearest_index)
         self._show_cursor_at_index(nearest_index, locked=True)
 
     def _find_nearest_index(self, x_value: float) -> int | None:
@@ -420,7 +509,7 @@ class RealtimePlotWidget(QWidget):
         if not self._x_values:
             return None
 
-        x_values = list(self._x_values)
+        x_values = self._as_list(self._x_values)
         insert_at = bisect_left(x_values, x_value)
         if insert_at <= 0:
             return 0
@@ -435,33 +524,40 @@ class RealtimePlotWidget(QWidget):
 
     def _find_frame_index(self, frame_id: int) -> int | None:
         """在当前窗口里查找某个帧号。"""
-        for index, frame in enumerate(self._frames):
-            if frame.frame_id == frame_id:
+        for index, current_frame_id in enumerate(self._frame_ids):
+            if current_frame_id == frame_id:
                 return index
         return None
 
     def _show_cursor_at_index(self, index: int, locked: bool) -> None:
         """把读点光标移动到指定位置。"""
-        if index < 0 or index >= len(self._frames):
+        if index < 0 or index >= len(self._x_values):
             return
 
         x_value = self._x_values[index]
-        frame = self._frames[index]
-        processing_result = self._processing_results[index]
         self._cursor_line.setPos(x_value)
         self._cursor_line.show()
 
         for key, _, _ in CHANNEL_SPECS:
-            if self._visible_channels[key]:
-                self._cursor_markers[key].setData([x_value], [self._channels[key][index]])
+            channel_value = self._channels[key][index]
+            if self._visible_channels[key] and isfinite(channel_value):
+                self._cursor_markers[key].setData([x_value], [channel_value])
                 self._cursor_markers[key].show()
             else:
                 self._cursor_markers[key].hide()
 
         state_text = "已锁定" if locked else "悬停"
-        self._update_readout_panel(frame, processing_result)
+        self._update_readout_panel_at_index(index)
+        pc_recv_time_text = self._pc_recv_time_at_index(index)
+        suffix = "" if not pc_recv_time_text else f"，接收={pc_recv_time_text}"
         self._readout_status.setText(
-            f"读点[{state_text}]：t={x_value:.3f} s，帧={frame.frame_id}，时间戳={frame.timestamp_ms} ms"
+            "读点[{state}]：t={time:.3f} s，帧={frame}，时间戳={timestamp} ms{suffix}".format(
+                state=state_text,
+                time=x_value,
+                frame=self._frame_id_at_index(index),
+                timestamp=self._timestamp_ms_at_index(index),
+                suffix=suffix,
+            )
         )
 
     def _build_readout_panel(self) -> QWidget:
@@ -509,9 +605,6 @@ class RealtimePlotWidget(QWidget):
             "vbat": frame.vbat_mv / 1000.0,
         }
 
-        for channel_key, voltage_v in raw_values.items():
-            self._raw_readout_labels[channel_key].setText(self._format_voltage(voltage_v))
-
         if processing_result is None:
             _resistance_ohm, temperature_c = frame.try_vtem_pt1000_metrics()
             va201_resistance_ohm = frame.try_va201_resistance_ohm()
@@ -523,21 +616,101 @@ class RealtimePlotWidget(QWidget):
             vm_voltage_v = processing_result.filtered_voltage_v("vm")
             vbat_voltage_v = processing_result.vbat_source_voltage_v()
 
-        self._converted_readout_labels["vtem"].setText(self._format_temperature(temperature_c))
-        self._converted_readout_labels["vm"].setText(self._format_voltage(vm_voltage_v))
-        self._converted_readout_labels["va201"].setText(self._format_resistance(va201_resistance_ohm))
-        self._converted_readout_labels["vbat"].setText(self._format_voltage(vbat_voltage_v))
+        self._set_readout_values(
+            raw_values,
+            {
+                "vtem": temperature_c,
+                "vm": vm_voltage_v,
+                "va201": va201_resistance_ohm,
+                "vbat": vbat_voltage_v,
+            },
+        )
+
+    def _update_readout_panel_at_index(self, index: int) -> None:
+        if index < len(self._frames):
+            self._update_readout_panel(self._frames[index], self._processing_results[index])
+            return
+
+        raw_values = {key: self._raw_channels[key][index] for key, _, _ in CHANNEL_SPECS}
+        plot_values = {key: self._channels[key][index] for key, _, _ in CHANNEL_SPECS}
+        self._set_readout_values(raw_values, self._calculate_converted_values(plot_values, raw_values))
+
+    def _set_readout_values(
+        self,
+        raw_values: dict[str, float],
+        converted_values: dict[str, float | None],
+    ) -> None:
+        for channel_key, voltage_v in raw_values.items():
+            self._raw_readout_labels[channel_key].setText(self._format_voltage(voltage_v))
+
+        self._converted_readout_labels["vtem"].setText(self._format_temperature(converted_values["vtem"]))
+        self._converted_readout_labels["vm"].setText(self._format_voltage(converted_values["vm"]))
+        self._converted_readout_labels["va201"].setText(self._format_resistance(converted_values["va201"]))
+        self._converted_readout_labels["vbat"].setText(self._format_voltage(converted_values["vbat"]))
+
+    def _calculate_converted_values(
+        self,
+        plot_values: dict[str, float],
+        raw_values: dict[str, float],
+    ) -> dict[str, float | None]:
+        vtem_voltage_v = self._first_finite(plot_values.get("vtem"), raw_values.get("vtem"))
+        va201_voltage_v = self._first_finite(plot_values.get("va201"), raw_values.get("va201"))
+        vm_voltage_v = self._first_finite(plot_values.get("vm"), raw_values.get("vm"))
+        vbat_voltage_v = self._first_finite(plot_values.get("vbat"), raw_values.get("vbat"))
+
+        return {
+            "vtem": self._try_convert(vtem_voltage_v, pt1000_temperature_from_divider_voltage_v),
+            "vm": vm_voltage_v,
+            "va201": self._try_convert(va201_voltage_v, a201_resistance_from_output_voltage_v),
+            "vbat": self._try_convert(vbat_voltage_v, vbat_source_voltage_from_adc_voltage_v),
+        }
+
+    def _frame_id_at_index(self, index: int) -> int:
+        return self._frame_ids[index] if index < len(self._frame_ids) else 0
+
+    def _timestamp_ms_at_index(self, index: int) -> int:
+        return self._timestamp_ms_values[index] if index < len(self._timestamp_ms_values) else 0
+
+    def _pc_recv_time_at_index(self, index: int) -> str:
+        return self._pc_recv_time_texts[index] if index < len(self._pc_recv_time_texts) else ""
+
+    @staticmethod
+    def _as_list(values: Any) -> list[float]:
+        return values if isinstance(values, list) else list(values)
+
+    @staticmethod
+    def _normalized_channel_values(values: list[float], expected_count: int) -> list[float]:
+        normalized = list(values[:expected_count])
+        if len(normalized) < expected_count:
+            normalized.extend([float("nan")] * (expected_count - len(normalized)))
+        return normalized
+
+    @staticmethod
+    def _first_finite(*values: float | None) -> float | None:
+        for value in values:
+            if value is not None and isfinite(value):
+                return value
+        return None
+
+    @staticmethod
+    def _try_convert(value: float | None, converter: Any) -> float | None:
+        if value is None or not isfinite(value):
+            return None
+        try:
+            return converter(value)
+        except ValueError:
+            return None
 
     @staticmethod
     def _format_voltage(voltage_v: float | None) -> str:
-        return "-" if voltage_v is None else f"{voltage_v:8.3f} V"
+        return "-" if voltage_v is None or not isfinite(voltage_v) else f"{voltage_v:8.3f} V"
 
     @staticmethod
     def _format_temperature(temperature_c: float | None) -> str:
-        return "-" if temperature_c is None else f"{temperature_c:8.2f} °C"
+        return "-" if temperature_c is None or not isfinite(temperature_c) else f"{temperature_c:8.2f} °C"
 
     def _format_resistance(self, resistance_ohm: float | None) -> str:
-        if resistance_ohm is None:
+        if resistance_ohm is None or not isfinite(resistance_ohm):
             return "-"
         if resistance_ohm >= 1_000_000.0:
             return f"{resistance_ohm / 1_000_000.0:.3f} MΩ"

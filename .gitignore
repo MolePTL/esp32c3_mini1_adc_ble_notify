@@ -3,3 +3,12 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+
+# Generated capture/export data
+/data/
+adc_capture_*.csv
+adc_export_*.csv
+
+# Python bytecode/cache
+__pycache__/
+*.py[cod]

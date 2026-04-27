@@ -17,6 +17,7 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
@@ -38,6 +39,7 @@ from PySide6.QtWidgets import (
 )
 
 from pc_app.ble_client import BleClientBridge
+from pc_app.csv_importer import ImportedCsvSeries, load_imported_csv_series
 from pc_app.data_logger import DataLogger
 from pc_app.plot_widget import RealtimePlotWidget
 from pc_app.protocol import (
@@ -166,8 +168,13 @@ class MainWindow(QMainWindow):
         control_layout = QVBoxLayout(control_group)
         top_row = QHBoxLayout()
         bottom_row = QHBoxLayout()
+        import_row = QHBoxLayout()
         self.record_button = QPushButton("开始记录")
         self.save_csv_button = QPushButton("导出 CSV")
+        self.import_csv_button = QPushButton("导入 CSV")
+        self.import_folder_button = QPushButton("导入文件夹")
+        self.import_prefer_filtered_checkbox = QCheckBox("导入优先滤波列")
+        self.import_prefer_filtered_checkbox.setChecked(True)
         self.clear_display_button = QPushButton("清空显示")
         self.clear_cache_button = QPushButton("清空缓存")
         self.exit_button = QPushButton("安全退出")
@@ -182,6 +189,10 @@ class MainWindow(QMainWindow):
 
         top_row.addWidget(self.record_button)
         top_row.addWidget(self.save_csv_button)
+        import_row.addWidget(self.import_csv_button)
+        import_row.addWidget(self.import_folder_button)
+        import_row.addWidget(self.import_prefer_filtered_checkbox)
+        import_row.addStretch(1)
         bottom_row.addWidget(self.clear_display_button)
         bottom_row.addWidget(self.clear_cache_button)
         bottom_row.addWidget(self.exit_button)
@@ -190,6 +201,7 @@ class MainWindow(QMainWindow):
         save_interval_row.addWidget(self.save_interval_spin)
         save_interval_row.addStretch(1)
         control_layout.addLayout(top_row)
+        control_layout.addLayout(import_row)
         control_layout.addLayout(bottom_row)
         control_layout.addLayout(save_interval_row)
         control_layout.addWidget(self.record_status_label)
@@ -339,6 +351,8 @@ class MainWindow(QMainWindow):
 
         self.record_button.clicked.connect(self._toggle_realtime_save)
         self.save_csv_button.clicked.connect(self._save_csv)
+        self.import_csv_button.clicked.connect(self._import_csv_files)
+        self.import_folder_button.clicked.connect(self._import_csv_folder)
         self.clear_display_button.clicked.connect(self._clear_display)
         self.clear_cache_button.clicked.connect(self._clear_unsaved_cache)
         self.exit_button.clicked.connect(self._request_safe_exit)
@@ -659,6 +673,101 @@ class MainWindow(QMainWindow):
                 session_count=self.logger.session_count,
                 path=saved_path,
                 channels=self._describe_channels(selected_channels),
+            )
+        )
+
+    def _import_csv_files(self) -> None:
+        if not self._can_import_offline_data():
+            return
+
+        default_dir = Path.cwd() / "data"
+        if not default_dir.exists():
+            default_dir = Path.cwd()
+        file_paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "导入 CSV",
+            str(default_dir),
+            "CSV Files (*.csv)",
+        )
+        if not file_paths:
+            return
+
+        self._load_imported_csv_paths([Path(file_path) for file_path in file_paths])
+
+    def _import_csv_folder(self) -> None:
+        if not self._can_import_offline_data():
+            return
+
+        default_dir = Path.cwd() / "data"
+        if not default_dir.exists():
+            default_dir = Path.cwd()
+        folder_path = QFileDialog.getExistingDirectory(self, "导入 CSV 文件夹", str(default_dir))
+        if not folder_path:
+            return
+
+        csv_paths = sorted(Path(folder_path).rglob("*.csv"))
+        if not csv_paths:
+            QMessageBox.information(self, "没有 CSV", "所选文件夹中没有找到 CSV 文件。")
+            return
+
+        self._load_imported_csv_paths(csv_paths)
+
+    def _can_import_offline_data(self) -> bool:
+        if self._is_connected:
+            QMessageBox.warning(self, "正在连接", "导入历史 CSV 前请先断开 BLE 连接。")
+            return False
+        if self.logger.is_realtime_save_active:
+            QMessageBox.warning(self, "正在记录", "导入历史 CSV 前请先停止实时保存。")
+            return False
+        return True
+
+    def _load_imported_csv_paths(self, csv_paths: list[Path]) -> None:
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        QApplication.processEvents()
+        try:
+            series = load_imported_csv_series(
+                csv_paths,
+                prefer_filtered=self.import_prefer_filtered_checkbox.isChecked(),
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "导入失败", str(exc))
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        self._apply_imported_series(series)
+
+    def _apply_imported_series(self, series: ImportedCsvSeries) -> None:
+        self.plot_widget.load_sample_series(
+            series.x_values,
+            series.raw_channels,
+            series.plot_channels,
+            series.frame_ids,
+            series.timestamp_ms_values,
+            series.pc_recv_time_texts,
+        )
+
+        available_channels = set(series.available_channels)
+        for channel_key, checkbox in self.display_channel_checkboxes.items():
+            previous = checkbox.blockSignals(True)
+            checkbox.setChecked(channel_key in available_channels)
+            checkbox.blockSignals(previous)
+            self.plot_widget.set_channel_visibility(channel_key, channel_key in available_channels)
+
+        self._sync_save_channels_with_display()
+        self.plot_widget.show_all_data()
+        self._set_display_enabled(True)
+        self._append_log(
+            "已导入 {files} 个 CSV，输入 {input_rows} 行，绘制 {rows} 行；"
+            "跳过 {skipped} 行，重复 {duplicates} 行；横轴：{axis}，数值：{mode}，通道：{channels}。".format(
+                files=series.file_count,
+                input_rows=series.input_row_count,
+                rows=series.imported_row_count,
+                skipped=series.skipped_row_count,
+                duplicates=series.duplicate_row_count,
+                axis=series.time_axis_label,
+                mode=series.value_mode_label,
+                channels=self._describe_channels(series.available_channels),
             )
         )
 
