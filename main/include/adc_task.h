@@ -19,7 +19,7 @@ extern "C" {
  *
  * 模块职责：
  * 1. 初始化 ADC oneshot 驱动
- * 2. 周期读取 4 路 ADC 数据
+ * 2. 周期读取 3 路 ADC 数据
  * 3. 尝试把 raw 值换算成 mV
  * 4. 维护“最近一次完整采样快照”供 BLE 模块读取
  *
@@ -30,10 +30,10 @@ extern "C" {
  */
 
 /*
- * 统一定义 4 路采样在数组中的逻辑索引。
+ * 统一定义 3 路采样在数组中的逻辑索引。
  *
  * 设计意图：
- * 这里不是简单写 0、1、2、3，而是显式给每一路命名，原因有三点：
+ * 这里不是简单写 0、1、2，而是显式给每一路命名，原因有三点：
  * 1. ADC 模块内部顺序固定，避免写魔法数字
  * 2. BLE 打包顺序固定，避免上下位机字段错位
  * 3. 上位机解析顺序固定，便于端到端一致
@@ -44,13 +44,10 @@ typedef enum {
     /* 第 0 路：板上定义为 VTEM。 */
     ADC_SAMPLE_INDEX_VTEM = 0,
 
-    /* 第 1 路：板上定义为 VM。 */
-    ADC_SAMPLE_INDEX_VM,
-
-    /* 第 2 路：板上定义为 VA201。 */
+    /* 第 1 路：板上定义为 VA201。 */
     ADC_SAMPLE_INDEX_VA201,
 
-    /* 第 3 路：板上定义为 VBAT。 */
+    /* 第 2 路：板上定义为 VBAT。 */
     ADC_SAMPLE_INDEX_VBAT,
 } adc_sample_index_t;
 
@@ -74,7 +71,7 @@ typedef struct {
     uint32_t timestamp_ms;
 
     /*
-     * 4 路通道的电压值，单位 mV。
+     * 3 路通道的电压值，单位 mV。
      * 数组下标必须使用 adc_sample_index_t，不能随意假设顺序。
      */
     uint16_t voltage_mv[APP_ADC_CHANNEL_COUNT];

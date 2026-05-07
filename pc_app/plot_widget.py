@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from bisect import bisect_left, bisect_right
 from collections import deque
-from math import isfinite
+from math import exp, isfinite, pi
 from typing import Any
 
 import pyqtgraph as pg
@@ -41,8 +41,13 @@ from pc_app.protocol import (
 from pc_app.vtem_processor import AdcProcessingResult
 
 
+DISPLAY_AGGREGATION_DISABLED = 1
+DISPLAY_AGGREGATION_SAMPLE_COUNT = 10
+DISPLAY_LOW_PASS_CUTOFF_HZ = 2.0
+
+
 class RealtimePlotWidget(QWidget):
-    """4 路电压波形显示控件。"""
+    """3 路电压波形显示控件。"""
 
     auto_follow_changed = Signal(bool)
 
@@ -69,6 +74,26 @@ class RealtimePlotWidget(QWidget):
         self._raw_channels = {
             key: deque(maxlen=max_points) for key, _, _ in CHANNEL_SPECS
         }
+        self._source_x_values: deque[float] = deque(maxlen=max_points)
+        self._source_frames: deque[AdcFrame] = deque(maxlen=max_points)
+        self._source_processing_results: deque[AdcProcessingResult | None] = deque(maxlen=max_points)
+        self._source_frame_ids: deque[int] = deque(maxlen=max_points)
+        self._source_timestamp_ms_values: deque[int] = deque(maxlen=max_points)
+        self._source_pc_recv_time_texts: deque[str] = deque(maxlen=max_points)
+        self._source_channels = {
+            key: deque(maxlen=max_points) for key, _, _ in CHANNEL_SPECS
+        }
+        self._source_raw_channels = {
+            key: deque(maxlen=max_points) for key, _, _ in CHANNEL_SPECS
+        }
+
+        self._display_aggregation_sample_count = DISPLAY_AGGREGATION_DISABLED
+        self._display_low_pass_enabled = False
+        self._display_aggregation_buffer: list[dict[str, Any]] = []
+        self._display_low_pass_values: dict[str, float | None] = {
+            key: None for key, _, _ in CHANNEL_SPECS
+        }
+        self._display_low_pass_timestamp_ms: int | None = None
 
         self._base_timestamp_ms: int | None = None
         self._last_timestamp_ms: int | None = None
@@ -94,7 +119,6 @@ class RealtimePlotWidget(QWidget):
 
         colors = {
             "vtem": "#E41A1C",
-            "vm": "#377EB8",
             "va201": "#4DAF4A",
             "vbat": "#FF7F00",
         }
@@ -140,7 +164,7 @@ class RealtimePlotWidget(QWidget):
         layout.addWidget(self._readout_status)
 
         self._refresh_timer = QTimer(self)
-        self._refresh_timer.setInterval(33)
+        self._refresh_timer.setInterval(10)
         self._refresh_timer.timeout.connect(self._refresh_plot)
         self._refresh_timer.start()
 
@@ -168,24 +192,39 @@ class RealtimePlotWidget(QWidget):
             self._base_timestamp_ms = frame.timestamp_ms
 
         x_value = (frame.timestamp_ms - self._base_timestamp_ms) / 1000.0
-        self._x_values.append(x_value)
-        self._frames.append(frame)
-        self._processing_results.append(processing_result)
-        self._frame_ids.append(frame.frame_id)
-        self._timestamp_ms_values.append(frame.timestamp_ms)
-        self._pc_recv_time_texts.append(frame.pc_recv_time.isoformat(timespec="milliseconds"))
+        pc_recv_time_text = frame.pc_recv_time.isoformat(timespec="milliseconds")
+        raw_values: dict[str, float] = {}
+        plot_values: dict[str, float] = {}
+
+        self._source_x_values.append(x_value)
+        self._source_frames.append(frame)
+        self._source_processing_results.append(processing_result)
+        self._source_frame_ids.append(frame.frame_id)
+        self._source_timestamp_ms_values.append(frame.timestamp_ms)
+        self._source_pc_recv_time_texts.append(pc_recv_time_text)
 
         for key, _, attr_name in CHANNEL_SPECS:
             raw_voltage_v = getattr(frame, attr_name) / 1000.0
-            self._raw_channels[key].append(raw_voltage_v)
+            raw_values[key] = raw_voltage_v
             if processing_result is not None:
-                self._channels[key].append(processing_result.filtered_voltage_v(key))
+                plot_values[key] = processing_result.filtered_voltage_v(key)
             else:
-                self._channels[key].append(raw_voltage_v)
+                plot_values[key] = raw_voltage_v
+            self._source_raw_channels[key].append(raw_values[key])
+            self._source_channels[key].append(plot_values[key])
+
+        display_appended = self._append_display_source_sample(
+            frame,
+            processing_result,
+            x_value,
+            pc_recv_time_text,
+            raw_values,
+            plot_values,
+        )
 
         self._last_timestamp_ms = frame.timestamp_ms
 
-        if self._cursor_locked and self._locked_frame_id is not None:
+        if display_appended and self._cursor_locked and self._locked_frame_id is not None:
             locked_index = self._find_frame_index(self._locked_frame_id)
             if locked_index is None:
                 self._cursor_locked = False
@@ -194,17 +233,43 @@ class RealtimePlotWidget(QWidget):
                 self._readout_status.setText("读点：已锁定的采样点已滑出当前窗口。")
             else:
                 self._show_cursor_at_index(locked_index, locked=True)
-        elif not self._cursor_locked:
-            self._update_readout_panel(frame, processing_result)
-            self._readout_status.setText(f"实时：帧={frame.frame_id}，时间戳={frame.timestamp_ms} ms")
+        elif display_appended and not self._cursor_locked and self._x_values:
+            latest_index = len(self._x_values) - 1
+            self._update_readout_panel_at_index(latest_index)
+            self._readout_status.setText(
+                f"实时：帧={self._frame_id_at_index(latest_index)}，时间戳={self._timestamp_ms_at_index(latest_index)} ms"
+            )
 
-        self._dirty = True
+        self._dirty = self._dirty or display_appended
 
     def set_live_updates_enabled(self, enabled: bool) -> None:
         """控制是否允许实时刷新图形。"""
         self._live_updates_enabled = enabled
         if enabled and self._dirty:
             self._refresh_plot(force=True)
+
+    def set_refresh_interval_ms(self, interval_ms: int) -> None:
+        """设置实时波形定时刷新间隔。"""
+        self._refresh_timer.setInterval(max(1, int(interval_ms)))
+        if self._dirty:
+            self._refresh_plot(force=True)
+
+    def set_display_processing(self, aggregation_sample_count: int, low_pass_enabled: bool) -> None:
+        """设置实时显示链路：全速显示或 10 帧聚合后低通显示。"""
+        aggregation_sample_count = max(DISPLAY_AGGREGATION_DISABLED, int(aggregation_sample_count))
+        low_pass_enabled = bool(low_pass_enabled)
+        if (
+            aggregation_sample_count == self._display_aggregation_sample_count
+            and low_pass_enabled == self._display_low_pass_enabled
+        ):
+            return
+
+        self._display_aggregation_sample_count = aggregation_sample_count
+        self._display_low_pass_enabled = low_pass_enabled
+        if self._offline_loaded:
+            return
+
+        self._rebuild_display_from_source()
 
     def set_channel_visibility(self, channel_key: str, visible: bool) -> None:
         """切换指定通道是否显示在图上。"""
@@ -316,38 +381,208 @@ class RealtimePlotWidget(QWidget):
         self._dirty = True
         self._refresh_plot(force=True)
 
+    def _append_display_source_sample(
+        self,
+        frame: AdcFrame,
+        processing_result: AdcProcessingResult | None,
+        x_value: float,
+        pc_recv_time_text: str,
+        raw_values: dict[str, float],
+        plot_values: dict[str, float],
+    ) -> bool:
+        if self._display_aggregation_sample_count <= DISPLAY_AGGREGATION_DISABLED:
+            self._append_full_rate_display_sample(
+                frame,
+                processing_result,
+                x_value,
+                pc_recv_time_text,
+                raw_values,
+                plot_values,
+            )
+            return True
+
+        return self._append_aggregated_display_sample(frame, x_value, pc_recv_time_text, raw_values)
+
+    def _append_full_rate_display_sample(
+        self,
+        frame: AdcFrame,
+        processing_result: AdcProcessingResult | None,
+        x_value: float,
+        pc_recv_time_text: str,
+        raw_values: dict[str, float],
+        plot_values: dict[str, float],
+    ) -> None:
+        self._x_values.append(x_value)
+        self._frames.append(frame)
+        self._processing_results.append(processing_result)
+        self._frame_ids.append(frame.frame_id)
+        self._timestamp_ms_values.append(frame.timestamp_ms)
+        self._pc_recv_time_texts.append(pc_recv_time_text)
+        for key, _, _ in CHANNEL_SPECS:
+            self._raw_channels[key].append(raw_values[key])
+            self._channels[key].append(plot_values[key])
+
+    def _append_aggregated_display_sample(
+        self,
+        frame: AdcFrame,
+        x_value: float,
+        pc_recv_time_text: str,
+        raw_values: dict[str, float],
+    ) -> bool:
+        self._display_aggregation_buffer.append(
+            {
+                "frame": frame,
+                "x_value": x_value,
+                "pc_recv_time_text": pc_recv_time_text,
+                "raw_values": dict(raw_values),
+            }
+        )
+        if len(self._display_aggregation_buffer) < self._display_aggregation_sample_count:
+            return False
+
+        rows = self._display_aggregation_buffer
+        last_row = rows[-1]
+        last_frame = last_row["frame"]
+        if not isinstance(last_frame, AdcFrame):
+            self._display_aggregation_buffer = []
+            return False
+
+        aggregated_raw_values = {
+            key: self._trimmed_mean(
+                [self._row_channel_value(row, key) for row in rows]
+            )
+            for key, _, _ in CHANNEL_SPECS
+        }
+        plot_values = (
+            self._apply_display_low_pass(aggregated_raw_values, last_frame.timestamp_ms)
+            if self._display_low_pass_enabled
+            else dict(aggregated_raw_values)
+        )
+
+        self._x_values.append(float(last_row["x_value"]))
+        self._frame_ids.append(last_frame.frame_id)
+        self._timestamp_ms_values.append(last_frame.timestamp_ms)
+        self._pc_recv_time_texts.append(str(last_row["pc_recv_time_text"]))
+        for key, _, _ in CHANNEL_SPECS:
+            self._raw_channels[key].append(aggregated_raw_values[key])
+            self._channels[key].append(plot_values[key])
+
+        self._display_aggregation_buffer = []
+        return True
+
+    def _rebuild_display_from_source(self) -> None:
+        self._reset_display_buffers()
+        self._reset_display_processing_state()
+
+        source_count = len(self._source_x_values)
+        for index in range(source_count):
+            frame = self._source_frames[index]
+            raw_values = {key: self._source_raw_channels[key][index] for key, _, _ in CHANNEL_SPECS}
+            plot_values = {key: self._source_channels[key][index] for key, _, _ in CHANNEL_SPECS}
+            self._append_display_source_sample(
+                frame,
+                self._source_processing_results[index],
+                self._source_x_values[index],
+                self._source_pc_recv_time_texts[index],
+                raw_values,
+                plot_values,
+            )
+
+        if self._x_values and not self._cursor_locked:
+            self._show_cursor_at_index(len(self._x_values) - 1, locked=False)
+        elif not self._x_values:
+            self._clear_cursor()
+            self._clear_readout_panel()
+
+        self._dirty = True
+        self._refresh_plot(force=True)
+
+    def _reset_display_buffers(self) -> None:
+        self._x_values = deque(maxlen=self._max_points)
+        self._frames = deque(maxlen=self._max_points)
+        self._processing_results = deque(maxlen=self._max_points)
+        self._frame_ids = deque(maxlen=self._max_points)
+        self._timestamp_ms_values = deque(maxlen=self._max_points)
+        self._pc_recv_time_texts = deque(maxlen=self._max_points)
+        self._channels = {
+            key: deque(maxlen=self._max_points) for key, _, _ in CHANNEL_SPECS
+        }
+        self._raw_channels = {
+            key: deque(maxlen=self._max_points) for key, _, _ in CHANNEL_SPECS
+        }
+        self._cursor_locked = False
+        self._locked_frame_id = None
+
+    def _reset_source_buffers(self) -> None:
+        self._source_x_values = deque(maxlen=self._max_points)
+        self._source_frames = deque(maxlen=self._max_points)
+        self._source_processing_results = deque(maxlen=self._max_points)
+        self._source_frame_ids = deque(maxlen=self._max_points)
+        self._source_timestamp_ms_values = deque(maxlen=self._max_points)
+        self._source_pc_recv_time_texts = deque(maxlen=self._max_points)
+        self._source_channels = {
+            key: deque(maxlen=self._max_points) for key, _, _ in CHANNEL_SPECS
+        }
+        self._source_raw_channels = {
+            key: deque(maxlen=self._max_points) for key, _, _ in CHANNEL_SPECS
+        }
+
+    def _reset_display_processing_state(self) -> None:
+        self._display_aggregation_buffer = []
+        self._display_low_pass_values = {key: None for key, _, _ in CHANNEL_SPECS}
+        self._display_low_pass_timestamp_ms = None
+
+    def _apply_display_low_pass(self, values: dict[str, float], timestamp_ms: int) -> dict[str, float]:
+        previous_timestamp_ms = self._display_low_pass_timestamp_ms
+        dt_s = None if previous_timestamp_ms is None else max(0.0, (timestamp_ms - previous_timestamp_ms) / 1000.0)
+        filtered_values: dict[str, float] = {}
+
+        for key, value in values.items():
+            previous_value = self._display_low_pass_values.get(key)
+            if previous_value is None or dt_s is None:
+                filtered_value = value
+            elif dt_s <= 0.0:
+                filtered_value = previous_value
+            else:
+                alpha = 1.0 - exp(-2.0 * pi * DISPLAY_LOW_PASS_CUTOFF_HZ * dt_s)
+                filtered_value = previous_value + alpha * (value - previous_value)
+
+            filtered_values[key] = filtered_value
+
+        self._display_low_pass_values.update(filtered_values)
+        self._display_low_pass_timestamp_ms = timestamp_ms
+        return filtered_values
+
+    @staticmethod
+    def _row_channel_value(row: dict[str, Any], channel_key: str) -> float:
+        raw_values = row["raw_values"]
+        if not isinstance(raw_values, dict):
+            return float("nan")
+        return float(raw_values[channel_key])
+
+    @staticmethod
+    def _trimmed_mean(values: list[float]) -> float:
+        if len(values) <= 2:
+            return sum(values) / len(values)
+
+        trimmed_values = sorted(values)[1:-1]
+        return sum(trimmed_values) / len(trimmed_values)
+
     def _reset_buffers(self, restore_live_buffers: bool = False) -> None:
         """重置内部缓存与时间基准。"""
         if restore_live_buffers or self._offline_loaded:
-            self._x_values = deque(maxlen=self._max_points)
-            self._frames = deque(maxlen=self._max_points)
-            self._processing_results = deque(maxlen=self._max_points)
-            self._frame_ids = deque(maxlen=self._max_points)
-            self._timestamp_ms_values = deque(maxlen=self._max_points)
-            self._pc_recv_time_texts = deque(maxlen=self._max_points)
-            self._channels = {
-                key: deque(maxlen=self._max_points) for key, _, _ in CHANNEL_SPECS
-            }
-            self._raw_channels = {
-                key: deque(maxlen=self._max_points) for key, _, _ in CHANNEL_SPECS
-            }
+            self._reset_display_buffers()
+            self._reset_source_buffers()
             self._offline_loaded = False
         else:
-            self._x_values.clear()
-            self._frames.clear()
-            self._processing_results.clear()
-            self._frame_ids.clear()
-            self._timestamp_ms_values.clear()
-            self._pc_recv_time_texts.clear()
-            for channel in self._channels.values():
-                channel.clear()
-            for channel in self._raw_channels.values():
-                channel.clear()
+            self._reset_display_buffers()
+            self._reset_source_buffers()
 
         self._base_timestamp_ms = None
         self._last_timestamp_ms = None
         self._cursor_locked = False
         self._locked_frame_id = None
+        self._reset_display_processing_state()
         self._clear_cursor()
         self._clear_readout_panel()
         self._readout_status.setText("读点：暂无数据。")
@@ -600,7 +835,6 @@ class RealtimePlotWidget(QWidget):
     ) -> None:
         raw_values = {
             "vtem": frame.vtem_mv / 1000.0,
-            "vm": frame.vm_mv / 1000.0,
             "va201": frame.va201_mv / 1000.0,
             "vbat": frame.vbat_mv / 1000.0,
         }
@@ -608,19 +842,16 @@ class RealtimePlotWidget(QWidget):
         if processing_result is None:
             _resistance_ohm, temperature_c = frame.try_vtem_pt1000_metrics()
             va201_resistance_ohm = frame.try_va201_resistance_ohm()
-            vm_voltage_v = frame.vm_mv / 1000.0
             vbat_voltage_v = frame.vbat_source_voltage_v
         else:
             temperature_c = processing_result.vtem.compensated_temperature_c
             va201_resistance_ohm = processing_result.try_va201_resistance_ohm()
-            vm_voltage_v = processing_result.filtered_voltage_v("vm")
             vbat_voltage_v = processing_result.vbat_source_voltage_v()
 
         self._set_readout_values(
             raw_values,
             {
                 "vtem": temperature_c,
-                "vm": vm_voltage_v,
                 "va201": va201_resistance_ohm,
                 "vbat": vbat_voltage_v,
             },
@@ -644,7 +875,6 @@ class RealtimePlotWidget(QWidget):
             self._raw_readout_labels[channel_key].setText(self._format_voltage(voltage_v))
 
         self._converted_readout_labels["vtem"].setText(self._format_temperature(converted_values["vtem"]))
-        self._converted_readout_labels["vm"].setText(self._format_voltage(converted_values["vm"]))
         self._converted_readout_labels["va201"].setText(self._format_resistance(converted_values["va201"]))
         self._converted_readout_labels["vbat"].setText(self._format_voltage(converted_values["vbat"]))
 
@@ -655,12 +885,10 @@ class RealtimePlotWidget(QWidget):
     ) -> dict[str, float | None]:
         vtem_voltage_v = self._first_finite(plot_values.get("vtem"), raw_values.get("vtem"))
         va201_voltage_v = self._first_finite(plot_values.get("va201"), raw_values.get("va201"))
-        vm_voltage_v = self._first_finite(plot_values.get("vm"), raw_values.get("vm"))
         vbat_voltage_v = self._first_finite(plot_values.get("vbat"), raw_values.get("vbat"))
 
         return {
             "vtem": self._try_convert(vtem_voltage_v, pt1000_temperature_from_divider_voltage_v),
-            "vm": vm_voltage_v,
             "va201": self._try_convert(va201_voltage_v, a201_resistance_from_output_voltage_v),
             "vbat": self._try_convert(vbat_voltage_v, vbat_source_voltage_from_adc_voltage_v),
         }

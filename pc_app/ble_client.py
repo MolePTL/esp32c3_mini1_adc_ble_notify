@@ -51,6 +51,9 @@ from pc_app.protocol import (
     uuid_matches,
 )
 
+FRAME_ID_MODULUS = 1 << 16
+MAX_REASONABLE_DROPPED_FRAMES = 1000
+
 
 class BleClientBridge(QObject):
     """把 bleak 的异步 BLE 通信能力桥接给 Qt 界面层。
@@ -198,13 +201,14 @@ class BleClientBridge(QObject):
             如果不主动关闭后台 BLE 线程，虽然进程退出时也可能被系统回收，
             但那不是一个教学上推荐的写法。
         """
-        # asyncio.run_coroutine_threadsafe() 的作用：
-        # 把一个协程扔到指定事件循环里执行，并立即返回一个 concurrent future。
-        future = asyncio.run_coroutine_threadsafe(self._disconnect_internal(), self._loop)
+        if self._loop.is_running():
+            # asyncio.run_coroutine_threadsafe() 的作用：
+            # 把一个协程扔到指定事件循环里执行，并立即返回一个 concurrent future。
+            future = asyncio.run_coroutine_threadsafe(self._disconnect_internal(), self._loop)
 
-        # shutdown 阶段优先保证“不因为异常卡死退出流程”。
-        with contextlib.suppress(Exception):
-            future.result(timeout=5)
+            # shutdown 阶段优先保证“不因为异常卡死退出流程”。
+            with contextlib.suppress(Exception):
+                future.result(timeout=5)
 
         # call_soon_threadsafe() 允许其他线程安全地给该事件循环投递一个“停止”动作。
         self._loop.call_soon_threadsafe(self._loop.stop)
@@ -492,6 +496,7 @@ class BleClientBridge(QObject):
             return
 
         # 成功解析后，更新“最近一帧”的核心统计信息。
+        self._update_frame_sequence_stats(frame.frame_id)
         self._stats.valid_frames += 1
         self._stats.last_frame_id = frame.frame_id
         self._stats.last_timestamp_ms = frame.timestamp_ms
@@ -503,6 +508,20 @@ class BleClientBridge(QObject):
 
         # 把解析好的结构化帧对象发给界面层。
         self.frame_received.emit(frame)
+
+    def _update_frame_sequence_stats(self, frame_id: int) -> None:
+        """根据连续 frame_id 估算丢帧数，支持 uint16 回绕。"""
+        previous_frame_id = self._stats.last_frame_id
+        if previous_frame_id is None:
+            return
+
+        delta = (frame_id - previous_frame_id) % FRAME_ID_MODULUS
+        if delta <= 1:
+            return
+
+        dropped = delta - 1
+        if dropped <= MAX_REASONABLE_DROPPED_FRAMES:
+            self._stats.dropped_frames += dropped
 
     def _refresh_fps(self) -> None:
         """按滑动时间窗口估算当前帧率。
@@ -542,6 +561,7 @@ class BleClientBridge(QObject):
             "device_address": self._connected_address,
             "valid_frames": self._stats.valid_frames,
             "invalid_frames": self._stats.invalid_frames,
+            "dropped_frames": self._stats.dropped_frames,
             "frame_rate": self._stats.frame_rate,
             "last_frame_id": self._stats.last_frame_id,
             "last_timestamp_ms": self._stats.last_timestamp_ms,

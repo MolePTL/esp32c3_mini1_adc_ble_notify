@@ -31,17 +31,17 @@
  */
 
 /*
- * 当前固件固定采 4 路 ADC。
+ * 当前固件固定采 3 路 ADC。
  * 这个宏不仅影响 ADC 模块本身，还会影响：
  * - BLE 协议里的“通道数”字段
  * - 数据缓存数组长度
- * - 上位机按固定 4 路解析的逻辑
+ * - 上位机按固定 3 路解析的逻辑
  */
-#define APP_ADC_CHANNEL_COUNT              4
+#define APP_ADC_CHANNEL_COUNT              3
 
 /*
  * ADC 采样周期，单位 ms。
- * 这里配置为 10ms，意味着 ADC 任务大约每 10ms 采一次 4 路数据。
+ * 这里配置为 10ms，意味着 ADC 任务大约每 10ms 采一次 3 路数据。
  *
  * 它影响：
  * - 数据时间分辨率
@@ -52,13 +52,27 @@
 
 /*
  * ADC 衰减配置。
- * ADC_ATTEN_DB_12 是 ESP-IDF 推荐的一个较常用衰减档位，
- * 用于扩展输入电压测量范围。
  *
- * 这个宏会传给 adc_oneshot_config_channel() 和 ADC 校准配置，
- * 因此必须保证驱动配置和校准配置保持一致。
+ * 当前三路不再共用同一个量程：
+ * - VTEM / VBAT 使用 ADC_ATTEN_DB_6，约 1.3V 档，提高低压段分辨率
+ * - VA201 保持 ADC_ATTEN_DB_12，保留原有较大量程
+ *
+ * 这些宏会传给 adc_oneshot_config_channel() 和 ADC 校准配置，
+ * 因此必须保证每路驱动配置和每路校准配置保持一致。
  */
-#define APP_ADC_ATTEN                      ADC_ATTEN_DB_12
+#define APP_ADC_ATTEN_VTEM                 ADC_ATTEN_DB_6
+#define APP_ADC_ATTEN_VA201                ADC_ATTEN_DB_12
+#define APP_ADC_ATTEN_VBAT                 ADC_ATTEN_DB_6
+
+/*
+ * ADC 校准不可用时的 raw -> mV 兜底满量程。
+ *
+ * 正常运行优先使用 ESP-IDF 的 ADC 校准结果；这些值只在校准不可用
+ * 或换算失败时作为近似线性换算的保底参数。
+ */
+#define APP_ADC_FALLBACK_FULL_SCALE_MV_VTEM  1300U
+#define APP_ADC_FALLBACK_FULL_SCALE_MV_VA201 3300U
+#define APP_ADC_FALLBACK_FULL_SCALE_MV_VBAT  1300U
 
 /*
  * 采样通道与原理图信号对应关系。
@@ -72,7 +86,6 @@
  * 这样教学上更清楚，也便于以后换板时单独调整。
  */
 #define APP_ADC_GPIO_VTEM                  0
-#define APP_ADC_GPIO_VM                    1
 #define APP_ADC_GPIO_VA201                 3
 #define APP_ADC_GPIO_VBAT                  4
 
@@ -125,7 +138,7 @@
 /*
  * 二进制帧协议版本号。
  *
- * 当前版本为 0x02，表示通道载荷字段语义为“毫伏值 mV”。
+ * 当前版本为 0x03，表示三路通道载荷字段语义为“毫伏值 mV”。
  * 如果以后协议格式变化，例如：
  * - 改字段顺序
  * - 改数据单位
@@ -133,7 +146,7 @@
  * - 增加 CRC 校验规则
  * 都应该同步提升版本号，避免上位机误解析。
  */
-#define APP_BLE_FRAME_VERSION              0x02
+#define APP_BLE_FRAME_VERSION              0x03
 
 /*
  * 自定义 128-bit Service UUID。
@@ -161,7 +174,7 @@
  * ==================== 数据帧配置 ====================
  * 这一组宏描述上位机与固件之间的固定二进制协议格式。
  *
- * 当前帧总长度固定为 20 字节，布局在 BLE 打包函数中实现。
+ * 当前帧总长度固定为 18 字节，布局在 BLE 打包函数中实现。
  * 使用固定长度的好处是：
  * - 上位机解析简单
  * - 内存管理简单
@@ -182,7 +195,7 @@
 #define APP_FRAME_CRC16_DEFAULT            0x0000
 
 /* 整帧固定长度，单位字节。 */
-#define APP_FRAME_LEN_BYTES                20
+#define APP_FRAME_LEN_BYTES                18
 
 /*
  * ==================== WS2812 配置 ====================

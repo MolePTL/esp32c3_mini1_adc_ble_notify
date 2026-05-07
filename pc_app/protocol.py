@@ -29,24 +29,23 @@ from uuid import UUID
 # 上位机收到一帧原始 bytes 后，通常先看前两个字节是否为 0xAA 0x55。
 FRAME_HEADER = b"\xAA\x55"
 
-# 当前协议固定长度为 20 字节。
+# 当前协议固定长度为 18 字节。
 # 这和固件端的 APP_FRAME_LEN_BYTES 必须保持一致。
-FRAME_LENGTH = 20
+FRAME_LENGTH = 18
 
-# 当前协议固定 4 路通道。
+# 当前协议固定 3 路通道。
 # 如果以后固件扩展成更多通道，这个常量和解析逻辑都需要同步更新。
-EXPECTED_CHANNEL_COUNT = 4
+EXPECTED_CHANNEL_COUNT = 3
 
 # 协议版本号。
-# 当前版本 0x02 表示通道载荷语义为“毫伏值 mV”。
+# 当前版本 0x03 表示三路通道载荷语义为“毫伏值 mV”。
 # 之所以保留版本字段，是为了防止上下位机版本不一致时误解析。
-EXPECTED_PROTOCOL_VERSION = 0x02
+EXPECTED_PROTOCOL_VERSION = 0x03
 
-# 协议中的 4 路通道固定顺序。
+# 协议中的 3 路通道固定顺序。
 # 这个常量用于把“协议字段名”“界面显示名”“AdcFrame 属性名”统一起来。
 CHANNEL_SPECS = (
     ("vtem", "VTEM", "vtem_mv"),
-    ("vm", "VM", "vm_mv"),
     ("va201", "VA201", "va201_mv"),
     ("vbat", "VBAT", "vbat_mv"),
 )
@@ -168,15 +167,15 @@ PT1000_COEFF_C = -4.183e-12
 
 # ==================== FlexiForce A201 换算配置 ====================
 # 当前按以下运放电路解释 VA201 通道：
-#   A201 -> 反相输入，0.5V 基准接同相输入，反馈电阻约 47.5kΩ
+#   A201 -> 反相输入，0.5V 基准接同相输入，反馈电阻 39kΩ
 A201_REFERENCE_V = 0.5
-A201_FEEDBACK_RESISTANCE_OHM = 75000.0
+A201_FEEDBACK_RESISTANCE_OHM = 39000.0
 
 # ==================== VBAT 分压换算配置 ====================
 # 当前按以下电阻顺序解释 VBAT 通道：
-#   VBAT -> 39kΩ -> ADC 节点 -> 100kΩ -> GND
-VBAT_DIVIDER_TOP_OHM = 39000.0
-VBAT_DIVIDER_BOTTOM_OHM = 100000.0
+#   VBAT -> 100kΩ -> ADC 节点 -> 39kΩ -> GND
+VBAT_DIVIDER_TOP_OHM = 100000.0
+VBAT_DIVIDER_BOTTOM_OHM = 39000.0
 
 
 def pt1000_resistance_from_divider_voltage_v(voltage_v: float) -> float:
@@ -258,7 +257,7 @@ def a201_resistance_from_output_voltage_v(voltage_v: float) -> float:
 
 
 def vbat_source_voltage_from_adc_voltage_v(voltage_v: float) -> float:
-    """按 39k/100k 分压把 VBAT ADC 节点电压还原为电池端电压。"""
+    """按 100k/39k 分压把 VBAT ADC 节点电压还原为电池端电压。"""
     divider_ratio = (VBAT_DIVIDER_TOP_OHM + VBAT_DIVIDER_BOTTOM_OHM) / VBAT_DIVIDER_BOTTOM_OHM
     return voltage_v * divider_ratio
 
@@ -313,7 +312,7 @@ class AdcFrame:
     protocol_version: int
 
     # 通道数量。
-    # 当前固定为 4，但保留这个字段有助于后续扩展或做一致性检查。
+    # 当前固定为 3，但保留这个字段有助于后续扩展或做一致性检查。
     channel_count: int
 
     # 帧序号。
@@ -324,10 +323,9 @@ class AdcFrame:
     # 这个值来自 ESP32 上运行中的时钟，不等于电脑本地时间。
     timestamp_ms: int
 
-    # 4 路通道的电压值，单位 mV。
+    # 3 路通道的电压值，单位 mV。
     # 字段顺序必须与固件打包顺序保持一致。
     vtem_mv: int
-    vm_mv: int
     va201_mv: int
     vbat_mv: int
 
@@ -336,8 +334,8 @@ class AdcFrame:
     crc16: int
 
     @property
-    def channels_mv(self) -> tuple[int, int, int, int]:
-        """按固定顺序返回 4 路通道的毫伏值。
+    def channels_mv(self) -> tuple[int, int, int]:
+        """按固定顺序返回 3 路通道的毫伏值。
 
         函数作用：
             给绘图、日志或后续批量处理提供统一顺序的数据接口。
@@ -346,13 +344,13 @@ class AdcFrame:
             当上层代码不想逐个写字段名，而是想按“通道列表”方式遍历时调用。
 
         返回值含义：
-            返回一个四元组，顺序固定为：VTEM、VM、VA201、VBAT。
+            返回一个三元组，顺序固定为：VTEM、VA201、VBAT。
         """
-        return (self.vtem_mv, self.vm_mv, self.va201_mv, self.vbat_mv)
+        return (self.vtem_mv, self.va201_mv, self.vbat_mv)
 
     @property
-    def channels_v(self) -> tuple[float, float, float, float]:
-        """把 4 路毫伏值统一换算成伏特值。
+    def channels_v(self) -> tuple[float, float, float]:
+        """把 3 路毫伏值统一换算成伏特值。
 
         设计说明：
             BLE 线上传输时使用整数 mV 更稳定、更节省协议设计复杂度；
@@ -421,6 +419,9 @@ class FrameStats:
 
     # 收到但未通过协议校验的无效帧数量。
     invalid_frames: int = 0
+
+    # 根据 frame_id 连续性估算出来的丢帧数量。
+    dropped_frames: int = 0
 
     # 当前估算出来的帧率（帧/秒）。
     frame_rate: float = 0.0
@@ -495,7 +496,7 @@ def validate_crc16(_payload: bytes) -> bool:
 
 
 def parse_frame(payload: bytes, recv_time: datetime | None = None) -> AdcFrame:
-    """把 20 字节 BLE Notify 数据解析成结构化帧对象。
+    """把 18 字节 BLE Notify 数据解析成结构化帧对象。
 
     函数作用：
         对收到的原始 `bytes` 做协议层校验和字段提取，返回 `AdcFrame`。
@@ -504,7 +505,7 @@ def parse_frame(payload: bytes, recv_time: datetime | None = None) -> AdcFrame:
         每次 BLE Notify 回调收到一帧原始数据时，由 BLE 模块调用。
 
     参数含义：
-        payload：原始字节序列，理论上应该正好是 20 字节。
+        payload：原始字节序列，理论上应该正好是 18 字节。
         recv_time：可选的接收时间。如果调用方不传，则自动用当前本机时间。
 
     返回值含义：
@@ -519,7 +520,7 @@ def parse_frame(payload: bytes, recv_time: datetime | None = None) -> AdcFrame:
         - 输出被 `main_window.py`、`plot_widget.py`、`data_logger.py` 继续使用
 
     解析流程说明：
-        1. 检查长度是否为固定 20 字节
+        1. 检查长度是否为固定 18 字节
         2. 检查帧头 0xAA 0x55
         3. 检查协议版本是否匹配
         4. 检查通道数是否匹配
@@ -550,7 +551,7 @@ def parse_frame(payload: bytes, recv_time: datetime | None = None) -> AdcFrame:
             f"invalid protocol version: expected 0x{EXPECTED_PROTOCOL_VERSION:02X}, got 0x{protocol_version:02X}"
         )
 
-    # 当前桌面端只接受固定 4 通道帧。
+    # 当前桌面端只接受固定 3 通道帧。
     if channel_count != EXPECTED_CHANNEL_COUNT:
         raise ProtocolError(
             f"invalid channel count: expected {EXPECTED_CHANNEL_COUNT}, got {channel_count}"
@@ -574,8 +575,7 @@ def parse_frame(payload: bytes, recv_time: datetime | None = None) -> AdcFrame:
         frame_id=int.from_bytes(payload[4:6], byteorder="little", signed=False),
         timestamp_ms=int.from_bytes(payload[6:10], byteorder="little", signed=False),
         vtem_mv=int.from_bytes(payload[10:12], byteorder="little", signed=False),
-        vm_mv=int.from_bytes(payload[12:14], byteorder="little", signed=False),
-        va201_mv=int.from_bytes(payload[14:16], byteorder="little", signed=False),
-        vbat_mv=int.from_bytes(payload[16:18], byteorder="little", signed=False),
-        crc16=int.from_bytes(payload[18:20], byteorder="little", signed=False),
+        va201_mv=int.from_bytes(payload[12:14], byteorder="little", signed=False),
+        vbat_mv=int.from_bytes(payload[14:16], byteorder="little", signed=False),
+        crc16=int.from_bytes(payload[16:18], byteorder="little", signed=False),
     )

@@ -98,9 +98,9 @@ class AdcProcessingResult:
 
 
 class SpikeFilter:
-    """Selectable spike filter shared by all channels."""
+    """Five-point median spike filter shared by all channels."""
 
-    def __init__(self, mode: str = SPIKE_FILTER_MEDIAN3) -> None:
+    def __init__(self, mode: str = SPIKE_FILTER_MEDIAN5) -> None:
         self._mode = mode
         self._median_window: deque[float] = deque(maxlen=self._median_window_size(mode))
         self._stable_value: float | None = None
@@ -164,7 +164,7 @@ class SpikeFilter:
 
     @staticmethod
     def _normalize_mode(mode: str) -> str:
-        return mode if mode in SPIKE_FILTER_LABELS else SPIKE_FILTER_MEDIAN3
+        return mode if mode in SPIKE_FILTER_LABELS else SPIKE_FILTER_MEDIAN5
 
     @staticmethod
     def _median_window_size(mode: str) -> int:
@@ -178,8 +178,8 @@ class AdcProcessor:
 
     def __init__(
         self,
-        spike_filter_mode: str = SPIKE_FILTER_MEDIAN3,
-        default_ema_cutoff_hz: float | None = 5.0,
+        spike_filter_mode: str = SPIKE_FILTER_MEDIAN5,
+        default_ema_cutoff_hz: float | None = 2.0,
         wire_compensation_ohm: float = 0.0,
     ) -> None:
         self._spike_filter_mode = spike_filter_mode

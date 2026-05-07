@@ -421,7 +421,7 @@ static void ble_service_start_advertising(void)
  *   由 BLE Notify 发送任务在每次准备发包前调用。
  *
  * 参数含义：
- *   frame：调用者提供的 20 字节缓冲区，函数会按协议布局写满它。
+ *   frame：调用者提供的 18 字节缓冲区，函数会按协议布局写满它。
  *
  * 返回值含义：
  *   无。
@@ -471,17 +471,15 @@ static void ble_service_build_frame(uint8_t frame[APP_FRAME_LEN_BYTES])
      * 按 little-endian 顺序写入剩余字段：
      * Byte  6~ 9：时间戳 ms
      * Byte 10~11：VTEM 电压 mV
-     * Byte 12~13：VM 电压 mV
-     * Byte 14~15：VA201 电压 mV
-     * Byte 16~17：VBAT 电压 mV
-     * Byte 18~19：CRC16（当前固定为 0）
+     * Byte 12~13：VA201 电压 mV
+     * Byte 14~15：VBAT 电压 mV
+     * Byte 16~17：CRC16（当前固定为 0）
      */
     ble_write_u32_le(&frame[6], sample.timestamp_ms);
     ble_write_u16_le(&frame[10], sample.voltage_mv[ADC_SAMPLE_INDEX_VTEM]);
-    ble_write_u16_le(&frame[12], sample.voltage_mv[ADC_SAMPLE_INDEX_VM]);
-    ble_write_u16_le(&frame[14], sample.voltage_mv[ADC_SAMPLE_INDEX_VA201]);
-    ble_write_u16_le(&frame[16], sample.voltage_mv[ADC_SAMPLE_INDEX_VBAT]);
-    ble_write_u16_le(&frame[18], APP_FRAME_CRC16_DEFAULT);
+    ble_write_u16_le(&frame[12], sample.voltage_mv[ADC_SAMPLE_INDEX_VA201]);
+    ble_write_u16_le(&frame[14], sample.voltage_mv[ADC_SAMPLE_INDEX_VBAT]);
+    ble_write_u16_le(&frame[16], APP_FRAME_CRC16_DEFAULT);
 }
 
 /*
@@ -711,7 +709,7 @@ static void ble_service_gatts_event_handler(esp_gatts_cb_event_t event,
     case ESP_GATTS_MTU_EVT:
         /*
          * MTU 更新事件。
-         * 当前 20 字节数据帧远小于默认 MTU，但记录日志有助于调试链路状态。
+         * 当前 18 字节数据帧远小于默认 MTU，但记录日志有助于调试链路状态。
          */
         ESP_LOGI(TAG, "MTU updated: %u", param->mtu.mtu);
         break;
@@ -939,7 +937,7 @@ esp_err_t ble_service_init(void)
      * esp_ble_gatt_set_local_mtu(128)：
      *   设置本地 MTU 上限。
      *
-     * 虽然当前协议帧只有 20 字节，远小于默认 ATT MTU，
+     * 虽然当前协议帧只有 18 字节，远小于默认 ATT MTU，
      * 但把 MTU 设得稍高一些，后续如果扩展协议会更从容。
      */
     ESP_ERROR_CHECK(esp_ble_gatt_set_local_mtu(128));

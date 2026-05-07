@@ -5,13 +5,14 @@
 2. 按用户当前选择，把需要的通道导出或实时写入 CSV
 
 这里特意把“完整缓存”和“导出过滤”分开：
-- 内部始终保留完整 4 路采样
+- 内部始终保留完整 3 路采样
 - 显示哪些通道、保存哪些通道，由上层单独控制
 """
 
 from __future__ import annotations
 
 import csv
+from math import isfinite
 from pathlib import Path
 from typing import Iterable, TextIO
 
@@ -24,6 +25,24 @@ BASE_CSV_COLUMNS = [
     "frame_id",
     "timestamp_ms",
 ]
+
+AGGREGATION_CSV_COLUMNS = [
+    "aggregation_method",
+    "aggregation_sample_count",
+    "frame_id_start",
+    "frame_id_end",
+    "timestamp_start_ms",
+    "timestamp_end_ms",
+]
+
+REALTIME_AGGREGATION_SAMPLE_COUNT = 10
+REALTIME_AGGREGATION_METHOD = "trimmed_mean_drop_min_max_10"
+CONFIG_VALUE_SUFFIXES = (
+    "_spike_filter_mode",
+    "_median_filter_enabled",
+    "_filter_cutoff_hz",
+    "_wire_compensation_ohm",
+)
 
 
 class DataLogger:
@@ -38,6 +57,7 @@ class DataLogger:
         self._realtime_save_file: TextIO | None = None
         self._realtime_save_writer: csv.DictWriter | None = None
         self._realtime_save_channels: tuple[str, ...] = ()
+        self._realtime_save_buffer: list[dict[str, object]] = []
 
     @property
     def frame_count(self) -> int:
@@ -72,8 +92,7 @@ class DataLogger:
 
         if self.is_realtime_save_active:
             row = self._build_row(session_index, frame, self._realtime_save_channels, processing_result)
-            self._realtime_save_writer.writerow(row)
-            self._realtime_save_file.flush()
+            self._append_realtime_save_row(row)
 
     def extend(self, frames: Iterable[AdcFrame]) -> None:
         for frame in frames:
@@ -94,7 +113,7 @@ class DataLogger:
         path.parent.mkdir(parents=True, exist_ok=True)
 
         selected_channels = self._normalize_channels(channels_to_save)
-        fieldnames = self._build_fieldnames(selected_channels)
+        fieldnames = self._build_fieldnames(selected_channels, include_aggregation=False)
 
         with path.open("w", newline="", encoding="utf-8") as csv_file:
             writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
@@ -117,7 +136,7 @@ class DataLogger:
         path.parent.mkdir(parents=True, exist_ok=True)
 
         selected_channels = self._normalize_channels(channels_to_save)
-        fieldnames = self._build_fieldnames(selected_channels)
+        fieldnames = self._build_fieldnames(selected_channels, include_aggregation=True)
 
         realtime_file = path.open("w", newline="", encoding="utf-8")
         writer = csv.DictWriter(realtime_file, fieldnames=fieldnames)
@@ -128,6 +147,7 @@ class DataLogger:
         self._realtime_save_file = realtime_file
         self._realtime_save_writer = writer
         self._realtime_save_channels = selected_channels
+        self._realtime_save_buffer.clear()
         return path
 
     def stop_realtime_save(self) -> Path | None:
@@ -140,6 +160,7 @@ class DataLogger:
         self._realtime_save_file = None
         self._realtime_save_writer = None
         self._realtime_save_channels = ()
+        self._realtime_save_buffer.clear()
         return path
 
     def _normalize_channels(self, channels_to_save: Iterable[str] | None) -> tuple[str, ...]:
@@ -150,8 +171,10 @@ class DataLogger:
         selected_set = {channel for channel in channels_to_save if channel in ordered_keys}
         return tuple(key for key in ordered_keys if key in selected_set)
 
-    def _build_fieldnames(self, selected_channels: tuple[str, ...]) -> list[str]:
+    def _build_fieldnames(self, selected_channels: tuple[str, ...], include_aggregation: bool = False) -> list[str]:
         fieldnames = list(BASE_CSV_COLUMNS)
+        if include_aggregation:
+            fieldnames.extend(AGGREGATION_CSV_COLUMNS)
         for channel_key in selected_channels:
             if channel_key == "vtem":
                 fieldnames.extend(
@@ -167,15 +190,6 @@ class DataLogger:
                         "vtem_resistance_filtered_ohm",
                         "vtem_resistance_compensated_ohm",
                         "vtem_temperature_compensated_c",
-                    ]
-                )
-            elif channel_key == "vm":
-                fieldnames.extend(
-                    [
-                        "vm_voltage_v",
-                        "vm_spike_filter_mode",
-                        "vm_filter_cutoff_hz",
-                        "vm_voltage_filtered_v",
                     ]
                 )
             elif channel_key == "va201":
@@ -201,6 +215,45 @@ class DataLogger:
                     ]
                 )
         return fieldnames
+
+    def _append_realtime_save_row(self, row: dict[str, object]) -> None:
+        self._realtime_save_buffer.append(row)
+        if len(self._realtime_save_buffer) < REALTIME_AGGREGATION_SAMPLE_COUNT:
+            return
+
+        aggregated_row = self._build_realtime_aggregation_row(self._realtime_save_buffer)
+        if self._realtime_save_writer is not None and self._realtime_save_file is not None:
+            self._realtime_save_writer.writerow(aggregated_row)
+            self._realtime_save_file.flush()
+        self._realtime_save_buffer.clear()
+
+    def _build_realtime_aggregation_row(self, rows: list[dict[str, object]]) -> dict[str, object]:
+        first_row = rows[0]
+        last_row = rows[-1]
+        aggregated_row: dict[str, object] = {}
+
+        for column_name, last_value in last_row.items():
+            if column_name in BASE_CSV_COLUMNS or self._is_config_value_column(column_name):
+                aggregated_row[column_name] = last_value
+                continue
+
+            numeric_values = [self._coerce_finite_float(row.get(column_name)) for row in rows]
+            if all(value is not None for value in numeric_values):
+                aggregated_row[column_name] = self._trimmed_mean([value for value in numeric_values if value is not None])
+            else:
+                aggregated_row[column_name] = last_value
+
+        aggregated_row.update(
+            {
+                "aggregation_method": REALTIME_AGGREGATION_METHOD,
+                "aggregation_sample_count": len(rows),
+                "frame_id_start": first_row.get("frame_id", ""),
+                "frame_id_end": last_row.get("frame_id", ""),
+                "timestamp_start_ms": first_row.get("timestamp_ms", ""),
+                "timestamp_end_ms": last_row.get("timestamp_ms", ""),
+            }
+        )
+        return aggregated_row
 
     def _build_row(
         self,
@@ -238,12 +291,6 @@ class DataLogger:
             row["vtem_temperature_compensated_c"] = self._blank_if_none(
                 None if vtem_result is None else vtem_result.compensated_temperature_c
             )
-
-        if "vm" in selected_channels:
-            row["vm_voltage_v"] = frame.vm_mv / 1000.0
-            row["vm_spike_filter_mode"] = self._spike_mode_or_blank(processing_result, "vm")
-            row["vm_filter_cutoff_hz"] = self._cutoff_or_blank(processing_result, "vm")
-            row["vm_voltage_filtered_v"] = self._filtered_voltage_or_blank(processing_result, "vm")
 
         if "va201" in selected_channels:
             resistance_ohm = frame.try_va201_resistance_ohm()
@@ -286,3 +333,33 @@ class DataLogger:
     @staticmethod
     def _blank_if_none(value: float | None) -> object:
         return "" if value is None else value
+
+    @staticmethod
+    def _is_config_value_column(column_name: str) -> bool:
+        return column_name.endswith(CONFIG_VALUE_SUFFIXES)
+
+    @staticmethod
+    def _coerce_finite_float(value: object) -> float | None:
+        if isinstance(value, bool) or value is None:
+            return None
+
+        if isinstance(value, (int, float)):
+            numeric_value = float(value)
+        else:
+            text = str(value).strip()
+            if not text:
+                return None
+            try:
+                numeric_value = float(text)
+            except ValueError:
+                return None
+
+        return numeric_value if isfinite(numeric_value) else None
+
+    @staticmethod
+    def _trimmed_mean(values: list[float]) -> float:
+        if len(values) <= 2:
+            return sum(values) / len(values)
+
+        trimmed_values = sorted(values)[1:-1]
+        return sum(trimmed_values) / len(trimmed_values)

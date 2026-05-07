@@ -23,7 +23,6 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
-    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -41,7 +40,7 @@ from PySide6.QtWidgets import (
 from pc_app.ble_client import BleClientBridge
 from pc_app.csv_importer import ImportedCsvSeries, load_imported_csv_series
 from pc_app.data_logger import DataLogger
-from pc_app.plot_widget import RealtimePlotWidget
+from pc_app.plot_widget import DISPLAY_AGGREGATION_SAMPLE_COUNT, RealtimePlotWidget
 from pc_app.protocol import (
     CHANNEL_SPECS,
     DEFAULT_CHARACTERISTIC_UUID,
@@ -52,14 +51,10 @@ from pc_app.protocol import (
     PT1000_DIVIDER_SUPPLY_V,
     AdcFrame,
 )
-from pc_app.vtem_processor import (
-    SPIKE_FILTER_HOLD,
-    SPIKE_FILTER_LABELS,
-    SPIKE_FILTER_MEDIAN3,
-    SPIKE_FILTER_MEDIAN5,
-    SPIKE_FILTER_NONE,
-    AdcProcessor,
-)
+from pc_app.vtem_processor import AdcProcessor, SPIKE_FILTER_MEDIAN5, SPIKE_FILTER_NONE
+
+
+FILTER_ENABLED_EMA_CUTOFF_HZ = 2.0
 
 
 class MainWindow(QMainWindow):
@@ -77,14 +72,13 @@ class MainWindow(QMainWindow):
 
         self.logger = DataLogger()
         self.ble = BleClientBridge(self)
-        self.adc_processor = AdcProcessor(default_ema_cutoff_hz=5.0)
+        self.adc_processor = AdcProcessor()
         self.realtime_save_timer = QTimer(self)
         self._realtime_save_segment_index = 0
         self._realtime_save_channels: tuple[str, ...] = ()
 
         self.display_channel_checkboxes: dict[str, QCheckBox] = {}
         self.save_channel_checkboxes: dict[str, QCheckBox] = {}
-        self.filter_channel_combos: dict[str, QComboBox] = {}
 
         self._build_ui()
         self._connect_signals()
@@ -98,6 +92,7 @@ class MainWindow(QMainWindow):
                 "device_address": "",
                 "valid_frames": 0,
                 "invalid_frames": 0,
+                "dropped_frames": 0,
                 "frame_rate": 0.0,
                 "last_frame_id": None,
                 "last_timestamp_ms": None,
@@ -151,6 +146,7 @@ class MainWindow(QMainWindow):
         self.frame_rate_label = QLabel("0.0 帧/秒")
         self.valid_frames_label = QLabel("0")
         self.invalid_frames_label = QLabel("0")
+        self.dropped_frames_label = QLabel("0")
         self.last_error_label = QLabel("-")
         self.last_error_label.setWordWrap(True)
 
@@ -162,6 +158,7 @@ class MainWindow(QMainWindow):
         status_layout.addRow("接收速率", self.frame_rate_label)
         status_layout.addRow("有效帧数", self.valid_frames_label)
         status_layout.addRow("无效帧数", self.invalid_frames_label)
+        status_layout.addRow("丢帧数", self.dropped_frames_label)
         status_layout.addRow("最近错误", self.last_error_label)
 
         control_group = QGroupBox("数据操作")
@@ -231,10 +228,16 @@ class MainWindow(QMainWindow):
         self.auto_follow_checkbox.setChecked(True)
         self.auto_range_checkbox = QCheckBox("自动量程")
         self.show_all_button = QPushButton("显示全部")
+        self.display_refresh_combo = QComboBox()
+        self.display_refresh_combo.addItem("100 Hz", 10)
+        self.display_refresh_combo.addItem("10 Hz", 100)
         view_row.addWidget(self.toggle_display_button)
         view_row.addWidget(self.auto_follow_checkbox)
         view_row.addWidget(self.auto_range_checkbox)
         view_row.addWidget(self.show_all_button)
+        view_row.addSpacing(12)
+        view_row.addWidget(QLabel("显示刷新率"))
+        view_row.addWidget(self.display_refresh_combo)
         view_row.addStretch(1)
 
         range_row = QHBoxLayout()
@@ -290,29 +293,12 @@ class MainWindow(QMainWindow):
         save_row.addWidget(self.save_follow_display_checkbox)
         save_row.addStretch(1)
 
-        filter_grid = QGridLayout()
-        filter_grid.addWidget(QLabel("去尖峰"), 0, 0)
-        self.spike_filter_combo = QComboBox()
-        for mode in (
-            SPIKE_FILTER_NONE,
-            SPIKE_FILTER_MEDIAN3,
-            SPIKE_FILTER_MEDIAN5,
-            SPIKE_FILTER_HOLD,
-        ):
-            self.spike_filter_combo.addItem(SPIKE_FILTER_LABELS[mode], mode)
-        self.spike_filter_combo.setCurrentIndex(1)
-        filter_grid.addWidget(self.spike_filter_combo, 0, 1)
-
-        for column, (channel_key, label, _) in enumerate(CHANNEL_SPECS):
-            filter_grid.addWidget(QLabel(f"{label} EMA"), 1, column * 2)
-            combo = QComboBox()
-            combo.addItem("关闭", None)
-            combo.addItem("2 Hz", 2.0)
-            combo.addItem("5 Hz", 5.0)
-            combo.addItem("10 Hz", 10.0)
-            combo.setCurrentIndex(2)
-            self.filter_channel_combos[channel_key] = combo
-            filter_grid.addWidget(combo, 1, column * 2 + 1)
+        filter_row = QHBoxLayout()
+        self.filter_enabled_checkbox = QCheckBox("滤波")
+        self.filter_enabled_checkbox.setChecked(True)
+        filter_row.addWidget(self.filter_enabled_checkbox)
+        filter_row.addWidget(QLabel("5点中值 + 2 Hz"))
+        filter_row.addStretch(1)
 
         vtem_row = QHBoxLayout()
         self.vtem_wire_comp_checkbox = QCheckBox("导线补偿")
@@ -331,7 +317,7 @@ class MainWindow(QMainWindow):
         scope_layout.addLayout(range_row)
         scope_layout.addLayout(display_row)
         scope_layout.addLayout(save_row)
-        scope_layout.addLayout(filter_grid)
+        scope_layout.addLayout(filter_row)
         scope_layout.addLayout(vtem_row)
 
         self.plot_widget = RealtimePlotWidget()
@@ -362,6 +348,7 @@ class MainWindow(QMainWindow):
         self.auto_follow_checkbox.toggled.connect(self.plot_widget.set_auto_follow_enabled)
         self.auto_range_checkbox.toggled.connect(self._handle_auto_range_toggled)
         self.show_all_button.clicked.connect(self._show_all_data)
+        self.display_refresh_combo.currentIndexChanged.connect(self._handle_display_refresh_rate_changed)
         self.window_length_combo.currentIndexChanged.connect(self._handle_window_length_changed)
         self.y_min_spin.valueChanged.connect(self._handle_manual_y_range_changed)
         self.y_max_spin.valueChanged.connect(self._handle_manual_y_range_changed)
@@ -369,13 +356,10 @@ class MainWindow(QMainWindow):
         self.show_all_channels_button.clicked.connect(self._show_all_channels)
         self.hide_all_channels_button.clicked.connect(self._hide_all_channels)
         self.save_follow_display_checkbox.toggled.connect(self._handle_save_follow_display_toggled)
-        self.spike_filter_combo.currentIndexChanged.connect(self._handle_filter_settings_changed)
+        self.filter_enabled_checkbox.toggled.connect(self._handle_filter_enabled_toggled)
         self.vtem_wire_comp_checkbox.toggled.connect(self._handle_vtem_wire_compensation_changed)
         self.vtem_wire_comp_spin.valueChanged.connect(self._handle_vtem_wire_compensation_changed)
         self.plot_widget.auto_follow_changed.connect(self._sync_auto_follow_checkbox)
-
-        for combo in self.filter_channel_combos.values():
-            combo.currentIndexChanged.connect(self._handle_filter_settings_changed)
 
         for channel_key, checkbox in self.display_channel_checkboxes.items():
             checkbox.toggled.connect(
@@ -396,6 +380,8 @@ class MainWindow(QMainWindow):
 
     def _apply_initial_scope_settings(self) -> None:
         self.plot_widget.set_window_duration_seconds(self.window_length_combo.currentData())
+        self.plot_widget.set_refresh_interval_ms(self.display_refresh_combo.currentData())
+        self._apply_display_processing_settings()
         self.plot_widget.set_auto_follow_enabled(self.auto_follow_checkbox.isChecked())
         self.plot_widget.set_auto_range_enabled(self.auto_range_checkbox.isChecked())
         for channel_key, checkbox in self.display_channel_checkboxes.items():
@@ -456,6 +442,7 @@ class MainWindow(QMainWindow):
         self.frame_rate_label.setText(f"{stats.get('frame_rate', 0.0):.1f} 帧/秒")
         self.valid_frames_label.setText(str(stats.get("valid_frames", 0)))
         self.invalid_frames_label.setText(str(stats.get("invalid_frames", 0)))
+        self.dropped_frames_label.setText(str(stats.get("dropped_frames", 0)))
 
         last_frame = stats.get("last_frame_id")
         last_timestamp = stats.get("last_timestamp_ms")
@@ -483,6 +470,22 @@ class MainWindow(QMainWindow):
     def _handle_window_length_changed(self) -> None:
         seconds = self.window_length_combo.currentData()
         self.plot_widget.set_window_duration_seconds(seconds)
+
+    def _handle_display_refresh_rate_changed(self) -> None:
+        interval_ms = self.display_refresh_combo.currentData()
+        self.plot_widget.set_refresh_interval_ms(interval_ms)
+        self._apply_display_processing_settings()
+        self._append_log(f"显示刷新率已切换为 {self.display_refresh_combo.currentText()}。")
+
+    def _apply_display_processing_settings(self) -> None:
+        interval_ms = int(self.display_refresh_combo.currentData() or 10)
+        aggregation_sample_count = (
+            DISPLAY_AGGREGATION_SAMPLE_COUNT if interval_ms >= 100 else 1
+        )
+        self.plot_widget.set_display_processing(
+            aggregation_sample_count=aggregation_sample_count,
+            low_pass_enabled=self.filter_enabled_checkbox.isChecked(),
+        )
 
     def _handle_manual_y_range_changed(self) -> None:
         if self.auto_range_checkbox.isChecked():
@@ -526,17 +529,24 @@ class MainWindow(QMainWindow):
             self._sync_save_channels_with_display()
         self._refresh_save_channel_controls()
 
-    def _handle_filter_settings_changed(self) -> None:
+    def _handle_filter_enabled_toggled(self, enabled: bool) -> None:
         self._apply_filter_settings(reset_filter=True)
         self.plot_widget.clear_data()
-        spike_mode = SPIKE_FILTER_LABELS[self.adc_processor.spike_filter_mode]
-        self._append_log(f"滤波设置已切换：{spike_mode}，滤波状态已重置。")
+        self._apply_display_processing_settings()
+        message = (
+            "滤波已开启：5点中值 + 2 Hz，滤波状态已重置。"
+            if enabled
+            else "滤波已关闭：后续显示和保存使用原始电压，滤波状态已重置。"
+        )
+        self._append_log(message)
 
     def _handle_vtem_wire_compensation_changed(self) -> None:
         self._apply_filter_settings(reset_filter=False)
 
     def _apply_filter_settings(self, reset_filter: bool) -> None:
-        spike_mode = self.spike_filter_combo.currentData()
+        filter_enabled = self.filter_enabled_checkbox.isChecked()
+        spike_mode = SPIKE_FILTER_MEDIAN5 if filter_enabled else SPIKE_FILTER_NONE
+        ema_cutoff_hz = FILTER_ENABLED_EMA_CUTOFF_HZ if filter_enabled else None
         wire_compensation_ohm = (
             self.vtem_wire_comp_spin.value() if self.vtem_wire_comp_checkbox.isChecked() else 0.0
         )
@@ -544,10 +554,9 @@ class MainWindow(QMainWindow):
         if reset_filter or spike_mode != self.adc_processor.spike_filter_mode:
             self.adc_processor.set_spike_filter_mode(spike_mode)
 
-        for channel_key, combo in self.filter_channel_combos.items():
-            cutoff_hz = combo.currentData()
-            if reset_filter or cutoff_hz != self.adc_processor.ema_cutoff_hz(channel_key):
-                self.adc_processor.set_channel_ema_cutoff_hz(channel_key, cutoff_hz)
+        for channel_key, _, _ in CHANNEL_SPECS:
+            if reset_filter or ema_cutoff_hz != self.adc_processor.ema_cutoff_hz(channel_key):
+                self.adc_processor.set_channel_ema_cutoff_hz(channel_key, ema_cutoff_hz)
 
         self.adc_processor.set_wire_compensation_ohm(wire_compensation_ohm)
         self.vtem_wire_comp_spin.setEnabled(self.vtem_wire_comp_checkbox.isChecked())
@@ -594,7 +603,7 @@ class MainWindow(QMainWindow):
         self.realtime_save_timer.start(int(self.save_interval_spin.value() * 1000))
         self._update_record_ui()
         self._append_log(
-            "实时保存已开始：{path}，保存通道：{channels}，分段间隔：{interval:.0f} s".format(
+            "实时保存已开始：{path}，保存通道：{channels}，记录方式：10帧截尾均值约10Hz，分段间隔：{interval:.0f} s".format(
                 path=saved_path,
                 channels=self._describe_channels(self._realtime_save_channels),
                 interval=self.save_interval_spin.value(),
@@ -621,7 +630,7 @@ class MainWindow(QMainWindow):
         self.record_button.setText("停止记录" if active else "开始记录")
         if active and self.logger.realtime_save_path is not None:
             self.record_status_label.setText(
-                f"记录状态：进行中 -> {self.logger.realtime_save_path}，间隔 {self.save_interval_spin.value():.0f} s"
+                f"记录状态：进行中 -> {self.logger.realtime_save_path}，10帧截尾均值约10Hz，间隔 {self.save_interval_spin.value():.0f} s"
             )
         else:
             self.record_status_label.setText("记录状态：未开启。")

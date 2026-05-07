@@ -6,7 +6,7 @@
  * 模块核心职责：
  * 1. 初始化 ADC oneshot 驱动
  * 2. 尝试为各通道初始化 ADC 校准
- * 3. 通过一个后台 FreeRTOS 任务周期采样 4 路数据
+ * 3. 通过一个后台 FreeRTOS 任务周期采样 3 路数据
  * 4. 把原始 raw 值转换成 mV
  * 5. 维护一份“最近一次完整采样快照”供 BLE 模块读取
  *
@@ -48,6 +48,8 @@ static const char *TAG = "ADC_TASK";
  * 这里显式做一个描述表，可以把三个概念分开：
  * - channel：给驱动用的 ADC 通道号
  * - gpio_num：给日志和板级理解用的 GPIO 号
+ * - atten：给驱动和校准共同使用的 ADC 衰减档位
+ * - fallback_full_scale_mv：校准不可用时的近似换算满量程
  * - name：给日志和调试看的可读名称
  */
 typedef struct {
@@ -62,6 +64,18 @@ typedef struct {
      * 主要用于打印日志，让人能把代码与原理图对应起来。
      */
     int gpio_num;
+
+    /*
+     * 当前逻辑通道使用的 ADC 衰减档位。
+     * 必须同时用于 adc_oneshot_config_channel() 和 ADC 校准初始化。
+     */
+    adc_atten_t atten;
+
+    /*
+     * 当前逻辑通道在 ADC 校准不可用时使用的 fallback 满量程。
+     * 只用于保底线性换算，不影响正常 ADC 校准路径。
+     */
+    uint16_t fallback_full_scale_mv;
 
     /*
      * 该通道的人类可读名称，用于日志输出。
@@ -81,10 +95,27 @@ typedef struct {
  * - 初学者能更直观看到“枚举值 -> 物理通道”的映射关系
  */
 static const adc_channel_desc_t s_channels[APP_ADC_CHANNEL_COUNT] = {
-    [ADC_SAMPLE_INDEX_VTEM]  = { .channel = ADC_CHANNEL_0, .gpio_num = APP_ADC_GPIO_VTEM,  .name = "VTEM"  },
-    [ADC_SAMPLE_INDEX_VM]    = { .channel = ADC_CHANNEL_1, .gpio_num = APP_ADC_GPIO_VM,    .name = "VM"    },
-    [ADC_SAMPLE_INDEX_VA201] = { .channel = ADC_CHANNEL_3, .gpio_num = APP_ADC_GPIO_VA201, .name = "VA201" },
-    [ADC_SAMPLE_INDEX_VBAT]  = { .channel = ADC_CHANNEL_4, .gpio_num = APP_ADC_GPIO_VBAT,  .name = "VBAT"  },
+    [ADC_SAMPLE_INDEX_VTEM] = {
+        .channel = ADC_CHANNEL_0,
+        .gpio_num = APP_ADC_GPIO_VTEM,
+        .atten = APP_ADC_ATTEN_VTEM,
+        .fallback_full_scale_mv = APP_ADC_FALLBACK_FULL_SCALE_MV_VTEM,
+        .name = "VTEM",
+    },
+    [ADC_SAMPLE_INDEX_VA201] = {
+        .channel = ADC_CHANNEL_3,
+        .gpio_num = APP_ADC_GPIO_VA201,
+        .atten = APP_ADC_ATTEN_VA201,
+        .fallback_full_scale_mv = APP_ADC_FALLBACK_FULL_SCALE_MV_VA201,
+        .name = "VA201",
+    },
+    [ADC_SAMPLE_INDEX_VBAT] = {
+        .channel = ADC_CHANNEL_4,
+        .gpio_num = APP_ADC_GPIO_VBAT,
+        .atten = APP_ADC_ATTEN_VBAT,
+        .fallback_full_scale_mv = APP_ADC_FALLBACK_FULL_SCALE_MV_VBAT,
+        .name = "VBAT",
+    },
 };
 
 /*
@@ -149,12 +180,33 @@ static portMUX_TYPE s_sample_lock = portMUX_INITIALIZER_UNLOCKED;
 
 /*
  * 函数作用：
+ *   把 ADC 衰减枚举转换成便于串口日志确认的文本。
+ */
+static const char *adc_task_atten_to_name(adc_atten_t atten)
+{
+    switch (atten) {
+    case ADC_ATTEN_DB_0:
+        return "ADC_ATTEN_DB_0";
+    case ADC_ATTEN_DB_2_5:
+        return "ADC_ATTEN_DB_2_5";
+    case ADC_ATTEN_DB_6:
+        return "ADC_ATTEN_DB_6";
+    case ADC_ATTEN_DB_12:
+        return "ADC_ATTEN_DB_12";
+    default:
+        return "ADC_ATTEN_UNKNOWN";
+    }
+}
+
+/*
+ * 函数作用：
  *   在 ADC 校准不可用时，用线性公式把 raw 值近似换算为毫伏值。
  *
  * 调用时机：
  *   仅在 adc_task_sampling_loop() 中，当 adc_task_raw_to_mv() 返回失败时调用。
  *
  * 参数含义：
+ *   channel_index：逻辑通道索引，用于找到该通道的 fallback 满量程
  *   raw：ADC 原始读数。当前默认假定其量程近似为 0~4095。
  *
  * 返回值含义：
@@ -171,9 +223,14 @@ static portMUX_TYPE s_sample_lock = portMUX_INITIALIZER_UNLOCKED;
  *   工程上这样做的意义是：即使某些环境下校准不支持，
  *   整条采样 -> BLE -> 上位机链路仍然可以继续工作。
  */
-static int adc_task_raw_to_mv_fallback(uint16_t raw)
+static int adc_task_raw_to_mv_fallback(adc_sample_index_t channel_index, uint16_t raw)
 {
-    return (int)(((uint32_t)raw * 3300U) / 4095U);
+    uint32_t full_scale_mv = 3300U;
+    if (channel_index < APP_ADC_CHANNEL_COUNT) {
+        full_scale_mv = s_channels[channel_index].fallback_full_scale_mv;
+    }
+
+    return (int)(((uint32_t)raw * full_scale_mv) / 4095U);
 }
 
 /*
@@ -222,6 +279,7 @@ static float adc_task_pt1000_resistance_derivative_below_zero(float temperature_
  *
  * 参数含义：
  *   channel：目标 ADC 通道号（驱动层通道号）
+ *   atten：目标 ADC 衰减档位，必须与采样配置一致
  *   out_handle：输出参数，成功时返回校准句柄，失败时置为 NULL
  *
  * 返回值含义：
@@ -238,7 +296,7 @@ static float adc_task_pt1000_resistance_derivative_below_zero(float temperature_
  *   ESP-IDF 的 ADC 校准方案可能因芯片、IDF 配置、编译开关而不同。
  *   因此这里不是假设“必然有某种校准”，而是按“有则用之，无则退化”的思路写。
  */
-static bool adc_task_try_init_cali(adc_channel_t channel, adc_cali_handle_t *out_handle)
+static bool adc_task_try_init_cali(adc_channel_t channel, adc_atten_t atten, adc_cali_handle_t *out_handle)
 {
     esp_err_t ret = ESP_FAIL;
     adc_cali_handle_t handle = NULL;
@@ -258,7 +316,7 @@ static bool adc_task_try_init_cali(adc_channel_t channel, adc_cali_handle_t *out
     adc_cali_curve_fitting_config_t cali_config = {
         .unit_id = ADC_UNIT_1,
         .chan = channel,
-        .atten = APP_ADC_ATTEN,
+        .atten = atten,
         .bitwidth = ADC_BITWIDTH_DEFAULT,
     };
 
@@ -284,7 +342,7 @@ static bool adc_task_try_init_cali(adc_channel_t channel, adc_cali_handle_t *out
     if (!calibrated) {
         adc_cali_line_fitting_config_t cali_config = {
             .unit_id = ADC_UNIT_1,
-            .atten = APP_ADC_ATTEN,
+            .atten = atten,
             .bitwidth = ADC_BITWIDTH_DEFAULT,
         };
 
@@ -353,7 +411,7 @@ static void adc_task_sampling_loop(void *arg)
 
     while (1) {
         /*
-         * 依次读取 4 路通道。
+         * 依次读取 3 路通道。
          * 这里以 APP_ADC_CHANNEL_COUNT 为上限，保证逻辑上与协议定义一致。
          */
         for (size_t i = 0; i < APP_ADC_CHANNEL_COUNT; ++i) {
@@ -400,7 +458,7 @@ static void adc_task_sampling_loop(void *arg)
                  * 这里不是“修 bug”，而是设计上的兜底路径。
                  * 目标是在尽量不丢功能的前提下保证项目可运行。
                  */
-                voltage_mv = adc_task_raw_to_mv_fallback((uint16_t)raw);
+                voltage_mv = adc_task_raw_to_mv_fallback((adc_sample_index_t)i, (uint16_t)raw);
             }
 
             /*
@@ -484,21 +542,16 @@ esp_err_t adc_task_init(void)
     ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_cfg, &s_adc_handle));
 
     /*
-     * 每个通道共享同一套采样配置：
-     * - atten    : 使用项目统一定义的衰减
-     * - bitwidth : 使用 ESP-IDF 默认位宽
-     */
-    adc_oneshot_chan_cfg_t chan_cfg = {
-        .atten = APP_ADC_ATTEN,
-        .bitwidth = ADC_BITWIDTH_DEFAULT,
-    };
-
-    /*
      * 逐通道完成两件事：
-     * 1. 配置 oneshot 采样参数
-     * 2. 尝试初始化校准
+     * 1. 按该通道自己的衰减档位配置 oneshot 采样参数
+     * 2. 按同一衰减档位尝试初始化校准
      */
     for (size_t i = 0; i < APP_ADC_CHANNEL_COUNT; ++i) {
+        adc_oneshot_chan_cfg_t chan_cfg = {
+            .atten = s_channels[i].atten,
+            .bitwidth = ADC_BITWIDTH_DEFAULT,
+        };
+
         /*
          * adc_oneshot_config_channel():
          *   把指定通道配置成可被 oneshot 驱动读取的状态。
@@ -506,15 +559,21 @@ esp_err_t adc_task_init(void)
         ESP_ERROR_CHECK(adc_oneshot_config_channel(s_adc_handle, s_channels[i].channel, &chan_cfg));
 
         /* 尝试给当前通道创建校准句柄。 */
-        s_cali_enabled[i] = adc_task_try_init_cali(s_channels[i].channel, &s_cali_handles[i]);
+        s_cali_enabled[i] = adc_task_try_init_cali(
+            s_channels[i].channel,
+            s_channels[i].atten,
+            &s_cali_handles[i]
+        );
 
         /*
          * ESP_LOGI 在这里非常有用：
          * 它能清楚告诉你板上每路 ADC 是否已经配置好、校准是否可用。
          */
-        ESP_LOGI(TAG, "Channel %s on GPIO%d configured, calibration: %s",
+        ESP_LOGI(TAG, "Channel %s on GPIO%d configured, atten: %s, fallback full scale: %umV, calibration: %s",
                  s_channels[i].name,
                  s_channels[i].gpio_num,
+                 adc_task_atten_to_name(s_channels[i].atten),
+                 (unsigned)s_channels[i].fallback_full_scale_mv,
                  s_cali_enabled[i] ? "enabled" : "disabled");
     }
 
