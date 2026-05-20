@@ -40,6 +40,8 @@ from PySide6.QtWidgets import (
 from pc_app.ble_client import BleClientBridge
 from pc_app.csv_importer import ImportedCsvSeries, load_imported_csv_series
 from pc_app.data_logger import DataLogger
+from pc_app.image_export_dialog import ImageExportDialog
+from pc_app.plot_image_exporter import export_imported_csv_series_plot
 from pc_app.plot_widget import DISPLAY_AGGREGATION_SAMPLE_COUNT, RealtimePlotWidget
 from pc_app.protocol import (
     CHANNEL_SPECS,
@@ -51,6 +53,7 @@ from pc_app.protocol import (
     PT1000_DIVIDER_SUPPLY_V,
     AdcFrame,
 )
+from pc_app.record_review_window import RecordReviewWindow
 from pc_app.vtem_processor import AdcProcessor, SPIKE_FILTER_MEDIAN5, SPIKE_FILTER_NONE
 
 
@@ -76,6 +79,9 @@ class MainWindow(QMainWindow):
         self.realtime_save_timer = QTimer(self)
         self._realtime_save_segment_index = 0
         self._realtime_save_channels: tuple[str, ...] = ()
+        self._realtime_save_paths: list[Path] = []
+        self._record_review_window: RecordReviewWindow | None = None
+        self._imported_series: ImportedCsvSeries | None = None
 
         self.display_channel_checkboxes: dict[str, QCheckBox] = {}
         self.save_channel_checkboxes: dict[str, QCheckBox] = {}
@@ -167,9 +173,12 @@ class MainWindow(QMainWindow):
         bottom_row = QHBoxLayout()
         import_row = QHBoxLayout()
         self.record_button = QPushButton("开始记录")
+        self.review_record_button = QPushButton("查看记录")
         self.save_csv_button = QPushButton("导出 CSV")
         self.import_csv_button = QPushButton("导入 CSV")
         self.import_folder_button = QPushButton("导入文件夹")
+        self.export_image_button = QPushButton("导出图片")
+        self.export_image_button.setEnabled(False)
         self.import_prefer_filtered_checkbox = QCheckBox("导入优先滤波列")
         self.import_prefer_filtered_checkbox.setChecked(True)
         self.clear_display_button = QPushButton("清空显示")
@@ -185,9 +194,11 @@ class MainWindow(QMainWindow):
         self.save_interval_spin.setSuffix(" s")
 
         top_row.addWidget(self.record_button)
+        top_row.addWidget(self.review_record_button)
         top_row.addWidget(self.save_csv_button)
         import_row.addWidget(self.import_csv_button)
         import_row.addWidget(self.import_folder_button)
+        import_row.addWidget(self.export_image_button)
         import_row.addWidget(self.import_prefer_filtered_checkbox)
         import_row.addStretch(1)
         bottom_row.addWidget(self.clear_display_button)
@@ -336,9 +347,11 @@ class MainWindow(QMainWindow):
         self.disconnect_button.clicked.connect(self.ble.disconnect_device)
 
         self.record_button.clicked.connect(self._toggle_realtime_save)
+        self.review_record_button.clicked.connect(self._open_record_review_window)
         self.save_csv_button.clicked.connect(self._save_csv)
         self.import_csv_button.clicked.connect(self._import_csv_files)
         self.import_folder_button.clicked.connect(self._import_csv_folder)
+        self.export_image_button.clicked.connect(self._export_imported_plot_image)
         self.clear_display_button.clicked.connect(self._clear_display)
         self.clear_cache_button.clicked.connect(self._clear_unsaved_cache)
         self.exit_button.clicked.connect(self._request_safe_exit)
@@ -427,13 +440,17 @@ class MainWindow(QMainWindow):
         if connected and not was_connected:
             self.adc_processor.reset()
             self.plot_widget.clear_data()
+            self._clear_imported_series_state()
             self._set_display_enabled(True)
         elif not connected and was_connected:
             self.logger.end_session()
             self.plot_widget.clear_data()
+            self._clear_imported_series_state()
             self._set_display_enabled(True)
 
     def _handle_frame(self, frame: AdcFrame) -> None:
+        if self._imported_series is not None:
+            self._clear_imported_series_state()
         processing_result = self.adc_processor.process(frame)
         self.logger.append(frame, processing_result)
         self.plot_widget.append_frame(frame, processing_result)
@@ -532,6 +549,7 @@ class MainWindow(QMainWindow):
     def _handle_filter_enabled_toggled(self, enabled: bool) -> None:
         self._apply_filter_settings(reset_filter=True)
         self.plot_widget.clear_data()
+        self._clear_imported_series_state()
         self._apply_display_processing_settings()
         message = (
             "滤波已开启：5点中值 + 2 Hz，滤波状态已重置。"
@@ -599,7 +617,9 @@ class MainWindow(QMainWindow):
 
         self._realtime_save_channels = self._selected_save_channels()
         self._realtime_save_segment_index = 1
-        saved_path = self._start_realtime_save_segment()
+        self._realtime_save_paths = []
+        self._sync_record_review_window_paths(reset_view=True)
+        saved_path = self._start_realtime_save_segment(reset_review_view=True)
         self.realtime_save_timer.start(int(self.save_interval_spin.value() * 1000))
         self._update_record_ui()
         self._append_log(
@@ -610,9 +630,12 @@ class MainWindow(QMainWindow):
             )
         )
 
-    def _start_realtime_save_segment(self) -> Path:
+    def _start_realtime_save_segment(self, reset_review_view: bool = False) -> Path:
         file_path = self._make_data_file_path("adc_capture", self._realtime_save_segment_index)
-        return self.logger.start_realtime_save(file_path, self._realtime_save_channels)
+        saved_path = self.logger.start_realtime_save(file_path, self._realtime_save_channels)
+        self._realtime_save_paths.append(saved_path)
+        self._sync_record_review_window_paths(reset_view=reset_review_view)
+        return saved_path
 
     def _rotate_realtime_save_file(self) -> None:
         if not self.logger.is_realtime_save_active:
@@ -621,7 +644,7 @@ class MainWindow(QMainWindow):
 
         old_path = self.logger.stop_realtime_save()
         self._realtime_save_segment_index += 1
-        new_path = self._start_realtime_save_segment()
+        new_path = self._start_realtime_save_segment(reset_review_view=False)
         self._update_record_ui()
         self._append_log(f"定时保存分段：{old_path} -> {new_path}")
 
@@ -635,10 +658,41 @@ class MainWindow(QMainWindow):
         else:
             self.record_status_label.setText("记录状态：未开启。")
         self.save_interval_spin.setEnabled(not active)
+        self.review_record_button.setEnabled(bool(self._realtime_save_paths))
         self._refresh_save_channel_controls()
+
+    def _open_record_review_window(self) -> None:
+        if not self._realtime_save_paths:
+            QMessageBox.information(self, "暂无记录", "当前还没有可回看的实时记录 CSV。")
+            return
+
+        if self._record_review_window is None:
+            self._record_review_window = RecordReviewWindow(self)
+            self._record_review_window.closed.connect(self._handle_record_review_window_closed)
+
+        reset_view = not self._record_review_window.isVisible()
+        self._record_review_window.set_csv_paths(
+            list(self._realtime_save_paths),
+            reset_view=reset_view,
+        )
+        if not reset_view:
+            self._record_review_window.refresh_now(show_all=False)
+        self._record_review_window.show()
+        self._record_review_window.raise_()
+        self._record_review_window.activateWindow()
+        self._append_log("已打开记录回看窗口。")
+
+    def _handle_record_review_window_closed(self) -> None:
+        self._record_review_window = None
+
+    def _sync_record_review_window_paths(self, reset_view: bool = False) -> None:
+        if self._record_review_window is None:
+            return
+        self._record_review_window.set_csv_paths(list(self._realtime_save_paths), reset_view=reset_view)
 
     def _clear_display(self) -> None:
         self.plot_widget.clear_data()
+        self._clear_imported_series_state()
         self._append_log("已清空当前波形显示。")
 
     def _clear_unsaved_cache(self) -> None:
@@ -652,11 +706,16 @@ class MainWindow(QMainWindow):
         self.plot_widget.show_all_data()
         self._append_log("已切换到显示当前缓存的全部时间范围。")
 
-    def _make_data_file_path(self, prefix: str, segment_index: int | None = None) -> Path:
+    def _make_data_file_path(
+        self,
+        prefix: str,
+        segment_index: int | None = None,
+        extension: str = ".csv",
+    ) -> Path:
         now = datetime.now()
         data_dir = Path.cwd() / "data" / now.strftime("%Y-%m-%d")
         suffix = "" if segment_index is None else f"_part{segment_index:03d}"
-        return data_dir / f"{prefix}_{now.strftime('%Y%m%d_%H%M%S')}{suffix}.csv"
+        return data_dir / f"{prefix}_{now.strftime('%Y%m%d_%H%M%S')}{suffix}{extension}"
 
     def _save_csv(self) -> None:
         if self.logger.frame_count == 0:
@@ -682,6 +741,61 @@ class MainWindow(QMainWindow):
                 session_count=self.logger.session_count,
                 path=saved_path,
                 channels=self._describe_channels(selected_channels),
+            )
+        )
+
+    def _export_imported_plot_image(self) -> None:
+        if self._imported_series is None:
+            QMessageBox.information(self, "暂无导入数据", "请先导入 CSV 后再导出图片。")
+            return
+        if not self._imported_series.export_columns:
+            QMessageBox.warning(self, "没有可导出数据", "当前 CSV 中没有可导出的数值列。")
+            return
+
+        visible_x_range = self.plot_widget.visible_x_range_seconds()
+        if visible_x_range is None:
+            QMessageBox.warning(self, "没有可导出数据", "当前波形视图中没有可导出的时间范围。")
+            return
+
+        dialog = ImageExportDialog(self._imported_series.export_columns, self)
+        if not dialog.exec():
+            return
+
+        options = dialog.selected_options()
+        value_label = dialog.selected_value_label()
+        default_path = self._make_data_file_path("adc_waveform", extension=".png")
+        default_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "导出图片",
+            str(default_path),
+            "PNG Images (*.png)",
+        )
+        if not file_path:
+            return
+
+        output_path = Path(file_path)
+        if output_path.suffix.lower() != ".png":
+            output_path = output_path.with_suffix(".png")
+
+        try:
+            saved_path = export_imported_csv_series_plot(
+                self._imported_series,
+                output_path,
+                options,
+                visible_x_range,
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "导出图片失败", str(exc))
+            return
+
+        self._append_log(
+            "已导出图片到 {path}，纵轴：{value}，尺寸：{width:.1f} x {height:.1f} cm，DPI：{dpi}".format(
+                path=saved_path,
+                value=value_label,
+                width=options.width_cm,
+                height=options.height_cm,
+                dpi=options.dpi,
             )
         )
 
@@ -747,6 +861,8 @@ class MainWindow(QMainWindow):
         self._apply_imported_series(series)
 
     def _apply_imported_series(self, series: ImportedCsvSeries) -> None:
+        self._imported_series = series
+        self.export_image_button.setEnabled(bool(series.export_columns))
         self.plot_widget.load_sample_series(
             series.x_values,
             series.raw_channels,
@@ -779,6 +895,10 @@ class MainWindow(QMainWindow):
                 channels=self._describe_channels(series.available_channels),
             )
         )
+
+    def _clear_imported_series_state(self) -> None:
+        self._imported_series = None
+        self.export_image_button.setEnabled(False)
 
     def _selected_save_channels(self) -> tuple[str, ...]:
         return tuple(
@@ -828,5 +948,7 @@ class MainWindow(QMainWindow):
             self.realtime_save_timer.stop()
             saved_path = self.logger.stop_realtime_save()
             self._append_log(f"退出前已停止实时保存：{saved_path}")
+        if self._record_review_window is not None:
+            self._record_review_window.close()
         self.ble.shutdown()
         super().closeEvent(event)

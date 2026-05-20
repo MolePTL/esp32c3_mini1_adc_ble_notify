@@ -13,6 +13,16 @@ from pc_app.protocol import CHANNEL_SPECS
 
 
 @dataclass(slots=True)
+class ImportedCsvValueColumn:
+    """One numeric CSV column that can be exported as a publication image."""
+
+    key: str
+    label: str
+    y_axis_label: str
+    values: list[float]
+
+
+@dataclass(slots=True)
 class ImportedCsvSeries:
     """Data loaded from one or more exported CSV files."""
 
@@ -23,6 +33,7 @@ class ImportedCsvSeries:
     timestamp_ms_values: list[int]
     pc_recv_time_texts: list[str]
     available_channels: tuple[str, ...]
+    export_columns: tuple[ImportedCsvValueColumn, ...]
     file_count: int
     input_row_count: int
     imported_row_count: int
@@ -36,6 +47,25 @@ class ImportedCsvSeries:
 class _CsvFileSummary:
     path: Path
     first_sort_value: int
+
+
+_EXPORT_VALUE_COLUMN_DEFS: tuple[tuple[str, str, str], ...] = (
+    ("vtem_voltage_v", "VTEM 电压", "电压 / V"),
+    ("vtem_voltage_filtered_v", "VTEM 滤波电压", "电压 / V"),
+    ("vtem_temperature_c", "VTEM 温度", "温度 / °C"),
+    ("vtem_temperature_compensated_c", "VTEM 补偿温度", "温度 / °C"),
+    ("vtem_resistance_ohm", "VTEM 电阻", "电阻 / Ω"),
+    ("vtem_resistance_filtered_ohm", "VTEM 滤波电阻", "电阻 / Ω"),
+    ("vtem_resistance_compensated_ohm", "VTEM 补偿电阻", "电阻 / Ω"),
+    ("va201_voltage_v", "VA201 电压", "电压 / V"),
+    ("va201_voltage_filtered_v", "VA201 滤波电压", "电压 / V"),
+    ("va201_resistance_ohm", "VA201 电阻", "电阻 / Ω"),
+    ("va201_resistance_filtered_ohm", "VA201 滤波电阻", "电阻 / Ω"),
+    ("vbat_voltage_v", "VBAT ADC 电压", "电压 / V"),
+    ("vbat_voltage_filtered_v", "VBAT 滤波 ADC 电压", "电压 / V"),
+    ("vbat_source_voltage_v", "VBAT 电源电压", "电压 / V"),
+    ("vbat_source_voltage_filtered_v", "VBAT 滤波电源电压", "电压 / V"),
+)
 
 
 def load_imported_csv_series(
@@ -55,6 +85,7 @@ def load_imported_csv_series(
 
     raw_channels = {key: [] for key, _, _ in CHANNEL_SPECS}
     plot_channels = {key: [] for key, _, _ in CHANNEL_SPECS}
+    export_value_buffers = {key: [] for key, _, _ in _EXPORT_VALUE_COLUMN_DEFS}
     frame_ids: list[int] = []
     timestamp_ms_values: list[int] = []
     pc_recv_time_texts: list[str] = []
@@ -88,6 +119,7 @@ def load_imported_csv_series(
                     timestamp_ms,
                     raw_values,
                     plot_values,
+                    export_values,
                     row_used_filtered,
                 ) = parsed
 
@@ -117,6 +149,9 @@ def load_imported_csv_series(
                     if isfinite(plot_value):
                         available_channels.add(channel_key)
 
+                for column_key in export_value_buffers:
+                    export_value_buffers[column_key].append(export_values[column_key])
+
                 used_filtered_column = used_filtered_column or row_used_filtered
                 used_pc_time_axis = used_pc_time_axis or sort_uses_pc_time
                 last_sort_value = sort_value if last_sort_value is None else max(last_sort_value, sort_value)
@@ -127,6 +162,16 @@ def load_imported_csv_series(
     ordered_available_channels = tuple(
         channel_key for channel_key, _, _ in CHANNEL_SPECS if channel_key in available_channels
     )
+    export_columns = tuple(
+        ImportedCsvValueColumn(
+            key=column_key,
+            label=label,
+            y_axis_label=y_axis_label,
+            values=export_value_buffers[column_key],
+        )
+        for column_key, label, y_axis_label in _EXPORT_VALUE_COLUMN_DEFS
+        if any(isfinite(value) for value in export_value_buffers[column_key])
+    )
     return ImportedCsvSeries(
         x_values=x_values,
         raw_channels=raw_channels,
@@ -135,6 +180,7 @@ def load_imported_csv_series(
         timestamp_ms_values=timestamp_ms_values,
         pc_recv_time_texts=pc_recv_time_texts,
         available_channels=ordered_available_channels,
+        export_columns=export_columns,
         file_count=len(summaries),
         input_row_count=input_row_count,
         imported_row_count=len(x_values),
@@ -167,7 +213,17 @@ def _summarize_file(path: Path) -> _CsvFileSummary | None:
 def _parse_row(
     row: dict[str, str],
     prefer_filtered: bool,
-) -> tuple[int, bool, str, int, int, tuple[float, ...], tuple[float, ...], bool] | None:
+) -> tuple[
+    int,
+    bool,
+    str,
+    int,
+    int,
+    tuple[float, ...],
+    tuple[float, ...],
+    dict[str, float],
+    bool,
+] | None:
     parsed_time = _parse_sort_value(row)
     if parsed_time is None:
         return None
@@ -197,6 +253,11 @@ def _parse_row(
     if not any(isfinite(value) for value in plot_values):
         return None
 
+    export_values = {
+        column_key: _parse_float(row.get(column_key))
+        for column_key, _, _ in _EXPORT_VALUE_COLUMN_DEFS
+    }
+
     return (
         sort_value,
         sort_uses_pc_time,
@@ -205,6 +266,7 @@ def _parse_row(
         timestamp_ms,
         tuple(raw_values),
         tuple(plot_values),
+        export_values,
         used_filtered,
     )
 

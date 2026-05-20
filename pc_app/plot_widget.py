@@ -335,6 +335,25 @@ class RealtimePlotWidget(QWidget):
 
         self._apply_view_ranges(force_show_all=True)
 
+    def visible_x_range_seconds(self) -> tuple[float, float] | None:
+        """Return the current visible X-axis range, clipped to available data."""
+        if not self._x_values:
+            return None
+
+        x_values = self._as_list(self._x_values)
+        data_min = min(x_values)
+        data_max = max(x_values)
+        view_min, view_max = self.plot_widget.getPlotItem().vb.viewRange()[0]
+        view_min, view_max = sorted((float(view_min), float(view_max)))
+        x_min = max(data_min, view_min)
+        x_max = min(data_max, view_max)
+
+        if x_min < x_max:
+            return x_min, x_max
+        if data_min < data_max:
+            return data_min, data_max
+        return data_min, data_min + 0.001
+
     def clear_data(self) -> None:
         """清空当前波形缓存并立即刷新显示。"""
         self._reset_buffers(restore_live_buffers=True)
@@ -349,6 +368,7 @@ class RealtimePlotWidget(QWidget):
         frame_ids: list[int],
         timestamp_ms_values: list[int],
         pc_recv_time_texts: list[str],
+        show_all: bool = True,
     ) -> None:
         """Load a complete offline series for review instead of live scrolling data."""
         self._reset_buffers(restore_live_buffers=True)
@@ -376,7 +396,8 @@ class RealtimePlotWidget(QWidget):
 
         if self._x_values:
             self._show_cursor_at_index(len(self._x_values) - 1, locked=False)
-            self._apply_view_ranges(force_show_all=True)
+            if show_all:
+                self._apply_view_ranges(force_show_all=True)
 
         self._dirty = True
         self._refresh_plot(force=True)
